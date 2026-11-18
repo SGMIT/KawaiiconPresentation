@@ -618,3 +618,41 @@ implies a spec change are marked `file-against-taniko`.
 - `.cursor/**` is now in `sandbox.protected` and deny-listed. The declaration
   can express adapter paths this way; it still cannot express "the hook
   process must load" — that is CLI behaviour outside the schema.
+
+## Correction C0 — Skills onto the branch
+
+### Adoption kit is absent at the pinned tag — `file-against-taniko`
+
+- **Needed:** the Tāniko skills and the conformance suite pinned to one
+  version, so a reviewer knows which guidance and which gates the harness was
+  built against.
+- **Offered:** `TANIKO_VERSION` pins the suite at `v0.4.0`, but
+  `adoption/` (prompts, skills, `install-skills.sh`) does not exist at that
+  tag. It exists only on Tāniko `master`.
+- **Implemented:** skills installed with
+  `adoption/install-skills.sh --tool all` from Tāniko `master` at `0d53fee`
+  (`v0.4.0-13-g0d53fee`) into `.agents/skills/`, `.claude/skills/`,
+  `.cursor/rules/` and `.github/skills/`. The installer merged its
+  `taniko-skills-start`/`-end` marker block into the existing `AGENTS.md`
+  without touching existing rules. Delta: skills and suite are now versioned
+  independently. Nothing in the declaration records the skills commit, and
+  doctor's `taniko-pin` check does not cover it.
+
+### The installer's source checkout and the pinned suite share a path
+
+- **Needed:** `../taniko` stays at the pinned tag (doctor `taniko-pin`, CI
+  clone).
+- **Offered:** the adoption kit has to be run from a `master` checkout.
+- **Implemented:** the first install switched `../taniko` itself to `master`,
+  and the gates briefly ran against `master` before it was moved back to
+  `v0.4.0` (`git switch --detach v0.4.0`). Doctor's `taniko-pin` check reads
+  `TANIKO_VERSION`, not the suite checkout, so it did not catch the drift.
+  Use a separate clone for `master`.
+- An earlier attempt also installed the skills on `main` and pushed them; that
+  was undone before this install.
+
+### Local interpreter differs from the declaration
+
+- `/usr/bin/python3` on this macOS host is 3.9.6, and doctor halts on
+  `python3 >=3.10`. Gates were run with Homebrew Python 3.12.7 plus
+  `jsonschema` in a venv outside the repo, matching CI (`setup-python 3.12`).

@@ -23,3 +23,14 @@ Never edit `.claude/`, `bin/`, `.github/`, `AGENTS.md`, `CLAUDE.md`, `TANIKO_VER
 - Every speaker on a talk slide has a `#### <title> — <speaker>` entry in `sources.md`.
 - Every external link on the Resources slide also appears in `sources.md`. Add the source there first.
 - Placeholders such as `[Point]` and `[Action]` are allowed while the deck is in progress.
+
+<!-- taniko-skills-start -->
+## Tāniko skills
+Read the matching skill before the activity it names. Installed by Tāniko's
+install-skills.sh — do not edit between these markers; re-run it to refresh.
+- .agents/skills/taniko-validate-run.md — Validate a completed agent run or phase against its evidence before accepting it
+- .agents/skills/taniko-review-agent-work.md — Review work an agent claims to have done and correct it so the fix sticks
+- .agents/skills/taniko-red-green.md — Enforceable test-first for agent-produced changes
+- .agents/skills/taniko-protect-gates.md — Set up and defend tamper isolation
+- .agents/skills/taniko-debug-verify-failure.md — Diagnose a failed verify or run from its bounded feedback
+<!-- taniko-skills-end -->
