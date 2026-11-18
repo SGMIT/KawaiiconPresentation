@@ -43,7 +43,8 @@ Talks were livestreamed on Twitch. As of 18 Nov 2026 no 2026 recordings were fou
 - **Write-ups:** Rodger D1, Zelle
 - **Recording:** none — not streamed or recorded
 
-#### Troubleshooting to SYSTEM: Local Privilege Escalation in Windows Diagnostics — Ben Wilson
+#### Troubleshooting to SYSTEM: LPE in Windows Diagnostics — Ben Wilson
+- **Full title:** Troubleshooting to SYSTEM: Local Privilege Escalation in Windows Diagnostics
 - **When:** Fri 30 Oct, 5:00pm–5:30pm
 - **Abstract:** <https://kawaiicon.org/talks/windows-diagnostics-privesc>
 - **Slides:** not found
@@ -92,7 +93,8 @@ Talks were livestreamed on Twitch. As of 18 Nov 2026 no 2026 recordings were fou
 - **Slides:** not found
 - **Write-ups:** Rodger D1
 
-#### Inside NZ's Digital Identity Stack (And How Do You Even Test This Thing?) — Nick von Dadelszen
+#### Inside NZ's Digital Identity Stack — Nick von Dadelszen
+- **Full title:** Inside NZ's Digital Identity Stack (And How Do You Even Test This Thing?)
 - **When:** Fri 30 Oct, 4:30pm–5:00pm
 - **Abstract:** <https://kawaiicon.org/talks/nz-digital-identity-stack>
 - **Slides:** not found
@@ -126,7 +128,8 @@ Talks were livestreamed on Twitch. As of 18 Nov 2026 no 2026 recordings were fou
 
 ### 6. AI & how we work
 
-#### Want me to take it from here? Changing how we work, live, and relate to the criminal justice system — Dylan Ayrey & Michael Nolan
+#### Want me to take it from here? — Dylan Ayrey & Michael Nolan
+- **Full title:** Want me to take it from here? Changing how we work, live, and relate to the criminal justice system
 - **When:** Fri 30 Oct, 9:15am–10:15am (opening talk)
 - **Abstract:** <https://kawaiicon.org/talks/want-me-to-take-it-from-here>
 - **Slides:** not found
@@ -158,7 +161,8 @@ Talks were livestreamed on Twitch. As of 18 Nov 2026 no 2026 recordings were fou
 - **Slides:** not found
 - **Write-ups:** Orthanc D1
 
-#### Heed The Wizard's Warnings — Burnout mitigation strategies & observability advice for Yourself-as-a-Service — The Wizard
+#### Heed The Wizard's Warnings — The Wizard
+- **Full title:** Heed The Wizard's Warnings — Burnout mitigation strategies & observability advice for Yourself-as-a-Service
 - **When:** Sat 31 Oct, 2:00pm–2:30pm
 - **Abstract:** <https://kawaiicon.org/talks/heed-the-wizards-warnings>
 - **Slides:** not found

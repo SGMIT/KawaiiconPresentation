@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Kawaiicon deck harness (Taniko 0.4.0 adapter). Standard library only.
 
-Commands: doctor [--json]
+Commands: doctor [--json], verify [--quick] [--json] [--no-cache],
+          tier-static, tier-content
 
 doctor has two duties (CONTRACTS section 1):
   drift   every .claude/harness.json toolchain[] entry is detected by running its
@@ -12,20 +13,41 @@ doctor has two duties (CONTRACTS section 1):
 Exit codes: 0 ok or warn, 2 drift (a check failed), 1 error (doctor could not
 complete or the declaration contains something doctor cannot evaluate).
 Usage errors exit 2 with usage on stderr and print no report.
+
+verify (CONTRACTS section 2) runs the declared verify.tiers[].command argv in
+declared order (full = every tier, --quick = verify.profiles.quick), fail-fast,
+each under its timeout_seconds. A tier's exit code is its verdict (0 pass,
+1 fail, 2 error); when KC_TIER_RESULT names a path the tier also writes its
+outcome there, and verify treats a missing or disagreeing record, a timeout, or
+a start failure as error, never fail. Verdicts are cached under the state dir,
+keyed by HEAD + tracked diff + untracked files + profile + declaration +
+harness + Python version; timeouts and start failures are not cached. An
+attempt is one distinct working tree verified under the current HEAD; the
+ledger counts attempts and attests exhaustion, but halting the loop is the
+loop driver's job. Exit codes: 0 pass, 1 fail, 2 error.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import html
+import html.entities
 import json
 import os
+import platform
+import posixpath
 import re
 import shutil
 import subprocess
 import sys
+import time
+import unicodedata
+import urllib.parse
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -480,12 +502,1016 @@ def internal_error(exc: BaseException, as_json: bool) -> int:
     return 1
 
 
+# -- verify: shared -------------------------------------------------------------
+
+COST_CLASSES = ("static", "build", "unit", "integration", "ui", "expensive")
+TIER_ID = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+EXIT_CODES = {"pass": 0, "fail": 1, "error": 2}
+VERDICT_BY_EXIT = {code: verdict for verdict, code in EXIT_CODES.items()}
+FB_SUMMARY_MAX, FB_DETAILS_MAX, FB_LOCATIONS_MAX, FB_MESSAGE_MAX = 500, 4000, 20, 300
+STAGE_DETAIL_MAX, VERIFY_TEXT_MAX, TIER_TEXT_MAX = 200, 2000, 4000
+DEFAULT_TIER_TIMEOUT = 300
+RESULT_ENV = "KC_TIER_RESULT"
+PIPELINE_STAGE = "pipeline"
+LOGS_KEPT = 100
+DECK_REL, SOURCES_REL, CSS_DIR = "index.html", "sources.md", "css"
+
+
+class TierError(Exception):
+    """The tier could not judge the deck (tooling or precondition): verdict error."""
+
+
+class Preflight(Exception):
+    """verify could not reach its first declared tier: verdict error."""
+
+
+def now_ms() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def new_id() -> str:
+    return f"vr_{uuid.uuid4().hex[:12]}"
+
+
+def elapsed_ms(start: float) -> int:
+    return int((time.monotonic() - start) * 1000)
+
+
+def clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def ascii_safe(text: str) -> str:
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def write_json_atomic(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(obj), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def violation(file: str, line: int, message: str, column: int | None = None) -> dict:
+    v = {"file": file, "line": max(1, int(line))}
+    if column:
+        v["column"] = max(1, int(column))
+    v["message"] = clip(" ".join(message.split()), FB_MESSAGE_MAX)
+    return v
+
+
+def where(v: dict) -> str:
+    return v["file"] + (f":{v['line']}" if "line" in v else "") + (f":{v['column']}" if "column" in v else "")
+
+
+def bounded_lines(lines: list[str], limit: int) -> str:
+    out, used = [], 0
+    for i, line in enumerate(lines):
+        if used + len(line) + 1 > limit - 40:
+            out.append(f"... {len(lines) - i} more not shown")
+            break
+        out.append(line)
+        used += len(line) + 1
+    return clip("\n".join(out), limit)
+
+
+def violations_outcome(tier: str, found: list[dict], detail_ok: str) -> dict:
+    if not found:
+        return {"verdict": "pass", "detail": clip(detail_ok, STAGE_DETAIL_MAX)}
+    n, first = len(found), found[0]
+    noun = "violation" if n == 1 else "violations"
+    return {
+        "verdict": "fail",
+        "detail": f"{n} {noun}",
+        "feedback": {
+            "summary": clip(f"{tier}: {n} {noun}; first at {where(first)}: {first['message']}", FB_SUMMARY_MAX),
+            "details": bounded_lines([f"{where(v)}: {v['message']}" for v in found], FB_DETAILS_MAX),
+            "locations": found[:FB_LOCATIONS_MAX],
+        },
+    }
+
+
+def read_repo_text(rel: str) -> str:
+    """Strict UTF-8; a leading BOM is dropped."""
+    text = (ROOT / rel).read_bytes().decode("utf-8")
+    return text[1:] if text.startswith("\ufeff") else text
+
+
+def utf8_violation(rel: str, e: UnicodeDecodeError) -> dict:
+    return violation(rel, e.object[: e.start].count(b"\n") + 1, f"not valid UTF-8 (byte offset {e.start})")
+
+
+def line_col(text: str, index: int) -> tuple[int, int]:
+    return text.count("\n", 0, index) + 1, index - (text.rfind("\n", 0, index) + 1) + 1
+
+
+def blank(text: str) -> str:
+    return re.sub(r"[^\n]", " ", text)
+
+
+# -- the deck as a tree ---------------------------------------------------------
+
+VOID_ELEMENTS = frozenset("area base br col embed hr img input link meta source track wbr".split())
+RAW_TEXT_ELEMENTS = frozenset(("script", "style"))
+HTML_SPACE = " \t\n\r\f"
+UNPARSED_MARKUP = re.compile(r"<[A-Za-z/!?]")
+
+
+class Node:
+    def __init__(self, tag: str, attrs: dict, line: int, column: int):
+        self.tag, self.attrs, self.line, self.column = tag, attrs, line, column
+        self.children: list = []
+
+    def classes(self) -> list[str]:
+        return (self.attrs.get("class") or "").split()
+
+    def elements(self) -> list["Node"]:
+        return [c for c in self.children if isinstance(c, Node)]
+
+    def text(self) -> str:
+        return "".join(c if isinstance(c, str) else c.text() for c in self.children)
+
+    def walk(self):
+        yield self
+        for child in self.elements():
+            yield from child.walk()
+
+    def label(self) -> str:
+        return self.tag + "".join(f".{c}" for c in self.classes())
+
+
+class DeckParser(HTMLParser):
+    """Strict well-formedness. Every non-void element needs an explicit end tag
+    (optional end tags such as </p> and </li> are required here); one <html> root
+    holds <head> then <body>; only whitespace, comments and the doctype may precede
+    <html>, and only whitespace may follow </html>."""
+
+    def __init__(self, rel: str):
+        super().__init__(convert_charrefs=True)
+        self.rel = rel
+        self.document = Node("#document", {}, 1, 1)
+        self.stack = [self.document]
+        self.root: Node | None = None
+        self.root_closed = False
+        self.doctype_seen = False
+        self.problems: list[dict] = []
+
+    def bad(self, message: str, line: int | None = None, column: int | None = None) -> None:
+        if line is None:
+            line, offset = self.getpos()
+            column = offset + 1
+        self.problems.append(violation(self.rel, line, message, column))
+
+    def bad_in(self, data: str, index: int, message: str) -> None:
+        line, offset = self.getpos()
+        prefix = data[:index]
+        if "\n" in prefix:
+            self.bad(message, line + prefix.count("\n"), len(prefix) - prefix.rfind("\n"))
+        else:
+            self.bad(message, line, offset + len(prefix) + 1)
+
+    def _open(self, tag: str, attrs: list, self_closing: bool) -> None:
+        line, offset = self.getpos()
+        names = [k for k, _ in attrs]
+        repeated = sorted({k for k in names if names.count(k) > 1})
+        if repeated:
+            self.bad(f"<{tag}> repeats attribute {', '.join(repeated)}")
+        if self.root_closed:
+            self.bad(f"<{tag}> after </html>; nothing but whitespace may follow </html>")
+        elif tag == "html" and self.root is not None:
+            self.bad("second <html>; the document must have exactly one <html> root")
+        elif tag != "html" and self.root is None:
+            self.bad(f"<{tag}> before <html>; every element must be inside the <html> root")
+        node = Node(tag, dict(attrs), line, offset + 1)
+        self.stack[-1].children.append(node)
+        if tag == "html" and self.root is None:
+            self.root = node
+        if tag in VOID_ELEMENTS:
+            return
+        if self_closing:
+            self.bad(f"<{tag}/>: browsers ignore '/' on a non-void element, so <{tag}> stays open; "
+                     f"write <{tag}></{tag}>")
+            return
+        self.stack.append(node)
+
+    def handle_starttag(self, tag, attrs):
+        self._open(tag, attrs, False)
+
+    def handle_startendtag(self, tag, attrs):
+        self._open(tag, attrs, True)
+
+    def handle_endtag(self, tag):
+        if tag in VOID_ELEMENTS:
+            self.bad(f"</{tag}>: <{tag}> is a void element and takes no end tag")
+            return
+        if tag not in (n.tag for n in self.stack[1:]):
+            self.bad(f"</{tag}> has no matching open <{tag}>")
+            return
+        line = self.getpos()[0]
+        while True:
+            node = self.stack.pop()
+            if node.tag == tag:
+                break
+            self.bad(f"<{node.tag}> is not closed before </{tag}> on line {line}; "
+                     "every non-void element needs an explicit end tag", node.line, node.column)
+        if node is self.root:
+            self.root_closed = True
+
+    def handle_data(self, data):
+        top = self.stack[-1]
+        if top.tag in RAW_TEXT_ELEMENTS:
+            top.children.append(data)
+            return
+        m = UNPARSED_MARKUP.search(data)
+        if m:
+            self.bad_in(data, m.start(), "unparsed markup: an unterminated tag or comment starts here")
+        if self.root is None or self.root_closed:
+            content = data.strip(HTML_SPACE)
+            if content:
+                place = "after </html>" if self.root_closed else "before <html>"
+                self.bad_in(data, data.index(content[0]),
+                            f"text {place} ({clip(content, 60)!r}); only whitespace may appear outside the <html> root")
+            return
+        top.children.append(data)
+
+    def handle_comment(self, data):
+        if self.root_closed:
+            self.bad("comment after </html>; nothing but whitespace may follow </html>")
+
+    def handle_decl(self, decl):
+        if not decl.lower().startswith("doctype"):
+            self.bad(f"unsupported declaration <!{clip(decl, 40)}>")
+        elif self.doctype_seen or self.root is not None:
+            self.bad("the doctype must appear once, before <html>")
+        self.doctype_seen = True
+
+    def unknown_decl(self, data):
+        self.bad(f"unsupported markup <![{clip(data, 40)}]]>")
+
+    def handle_pi(self, data):
+        self.bad("processing instruction <?...>; this is not HTML")
+
+    def finish(self) -> "DeckParser":
+        self.close()
+        for node in reversed(self.stack[1:]):
+            self.bad(f"<{node.tag}> is never closed", node.line, node.column)
+        self.stack = [self.document]
+        if self.root is None:
+            self.bad("no <html> element", 1, 1)
+        else:
+            inner = [n.tag for n in self.root.elements()]
+            if inner != ["head", "body"]:
+                self.bad(f"<html> must contain <head> then <body> and nothing else; found {', '.join(inner) or 'nothing'}",
+                         self.root.line, self.root.column)
+        return self
+
+
+def parse_deck(source: str) -> DeckParser:
+    parser = DeckParser(DECK_REL)
+    parser.feed(source)
+    return parser.finish()
+
+
+CHAR_REF = re.compile(r"&(?:#[xX]([0-9A-Fa-f]+)|#([0-9]+)|([A-Za-z][A-Za-z0-9]*));")
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+RAW_TEXT_BODY = re.compile(r"(<(script|style)\b[^>]*>)(.*?)(?=</\2\s*>)", re.S | re.I)
+
+
+def entity_problems(source: str) -> list[dict]:
+    """Terminated references must be real: &name; known to HTML5, &#n; a valid code
+    point. A bare '&' (URL query strings, AT&T) is legal and not flagged."""
+    masked = HTML_COMMENT.sub(lambda m: blank(m.group(0)), source)
+    masked = RAW_TEXT_BODY.sub(lambda m: m.group(1) + blank(m.group(3)), masked)
+    out = []
+    for m in CHAR_REF.finditer(masked):
+        hex_digits, dec_digits, name = m.groups()
+        if name is not None:
+            if name + ";" in html.entities.html5:
+                continue
+            message = f"&{name}; is not a known HTML character reference (write &amp;{name}; for a literal '&')"
+        else:
+            cp = int(hex_digits, 16) if hex_digits is not None else int(dec_digits)
+            if 0 < cp <= 0x10FFFF and not 0xD800 <= cp <= 0xDFFF:
+                continue
+            message = f"{m.group(0)} is not a valid code point"
+        line, col = line_col(masked, m.start())
+        out.append(violation(DECK_REL, line, message, col))
+    return out
+
+
+# -- static tier ----------------------------------------------------------------
+
+SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
+REF_ATTRS = ("href", "src")
+CSS_COMMENT = re.compile(r"/\*.*?(?:\*/|\Z)", re.S)
+CSS_URL = re.compile(r"""url\(\s*(?:"([^"]*)"|'([^']*)'|([^)"'\s]*))\s*\)""", re.I)
+CSS_IMPORT = re.compile(r"""@import\s+(?:"([^"]*)"|'([^']*)')""", re.I)
+
+
+def resolve_local(path: str, base_dir: str, listings: dict) -> tuple[str | None, str]:
+    """Resolve a local URL path to a repo file, matching case on every component."""
+    if "\\" in path:
+        return None, "uses a backslash; URL paths use '/'"
+    if path.startswith("/"):
+        return None, "is root-relative, so it resolves against the site root rather than the repo; use a relative path"
+    rel = posixpath.normpath(posixpath.join(base_dir, urllib.parse.unquote(path)))
+    if rel == ".." or rel.startswith("../"):
+        return None, "points outside the repo"
+    current = ROOT
+    for part in [] if rel == "." else rel.split("/"):
+        if current not in listings:
+            try:
+                listings[current] = os.listdir(current)
+            except OSError:
+                listings[current] = []
+        names = listings[current]
+        if part not in names:
+            other = next((n for n in names if n.casefold() == part.casefold()), None)
+            if other is not None:
+                return None, f"does not match the case of '{other}'; it would 404 on a case-sensitive host"
+            return None, "does not resolve to a file in the repo"
+        current = current / part
+    if not current.is_file():
+        return None, "is a directory, not a file"
+    return rel, ""
+
+
+def check_ref(value: str, shown: str, base_dir: str, file: str, line: int, column: int,
+              listings: dict, found: list, targets: list) -> str:
+    v = value.strip(HTML_SPACE)
+    if not v:
+        found.append(violation(file, line, f"{shown} is empty", column))
+        return "local"
+    if SCHEME.match(v) or v.startswith("//"):
+        return "remote"
+    path = re.split(r"[?#]", v, maxsplit=1)[0]
+    if not path:
+        return "fragment"
+    rel, reason = resolve_local(path, base_dir, listings)
+    if rel is None:
+        found.append(violation(file, line, f"{shown} {reason}", column))
+    else:
+        targets.append((rel, file, line, column, shown))
+    return "local"
+
+
+def git_listing(*args: str) -> list[str]:
+    if shutil.which("git") is None:
+        raise TierError("git is not on PATH")
+    proc = git(*args)
+    if proc.returncode != 0:
+        raise TierError(f"git {args[0]} failed: {proc.stderr.decode('utf-8', 'replace').strip()[:200]}")
+    return sorted({p.decode("utf-8") for p in proc.stdout.split(b"\0") if p})
+
+
+def ignored_paths(rels: list[str]) -> set[str]:
+    if not rels:
+        return set()
+    proc = subprocess.run(["git", "-C", str(ROOT), "check-ignore", "-z", "--stdin"],
+                          input="\0".join(rels).encode("utf-8"), capture_output=True, timeout=GIT_TIMEOUT)
+    if proc.returncode not in (0, 1):
+        raise TierError(f"git check-ignore failed: {proc.stderr.decode('utf-8', 'replace').strip()[:200]}")
+    return {p.decode("utf-8") for p in proc.stdout.split(b"\0") if p}
+
+
+def css_refs(text: str):
+    masked = CSS_COMMENT.sub(lambda m: blank(m.group(0)), text)
+    for rx, kind in ((CSS_URL, "url"), (CSS_IMPORT, "@import")):
+        for m in rx.finditer(masked):
+            value = next(g for g in m.groups() if g is not None)
+            line, col = line_col(masked, m.start())
+            yield f"{kind}({clip(value, 120)})" if kind == "url" else f"@import '{clip(value, 120)}'", value, line, col
+
+
+def tier_static() -> dict:
+    """index.html is well-formed, and every local href/src in it and every url()/@import
+    in css/ resolves to a non-ignored repo file with exact case. Remote URLs are
+    counted, never fetched."""
+    try:
+        source = read_repo_text(DECK_REL)
+    except FileNotFoundError:
+        return violations_outcome("static", [violation(DECK_REL, 1, f"{DECK_REL} is missing")], "")
+    except UnicodeDecodeError as e:
+        return violations_outcome("static", [utf8_violation(DECK_REL, e)], "")
+    parser = parse_deck(source)
+    found = parser.problems + entity_problems(source)
+    targets: list = []
+    listings: dict = {}
+    counts = Counter()
+    for node in parser.document.walk():
+        for attr in REF_ATTRS:
+            if attr in node.attrs:
+                value = node.attrs[attr] or ""
+                counts[check_ref(value, f'{attr}="{clip(value, 120)}"', "", DECK_REL, node.line, node.column,
+                                 listings, found, targets)] += 1
+    sheets = [p for p in git_listing("ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", CSS_DIR)
+              if p.lower().endswith(".css") and (ROOT / p).is_file()]
+    for rel in sheets:
+        try:
+            text = read_repo_text(rel)
+        except UnicodeDecodeError as e:
+            found.append(utf8_violation(rel, e))
+            continue
+        for shown, value, line, col in css_refs(text):
+            counts[check_ref(value, shown, posixpath.dirname(rel), rel, line, col, listings, found, targets)] += 1
+    ignored = ignored_paths(sorted({t[0] for t in targets}))
+    for rel, file, line, col, shown in targets:
+        if rel in ignored:
+            found.append(violation(file, line, f"{shown} resolves to {rel}, which is gitignored: "
+                                               "a clone or the published deck will not have it", col))
+    found.sort(key=lambda v: (v["file"] != DECK_REL, v["file"], v["line"], v.get("column", 0)))
+    return violations_outcome("static", found,
+                              f"well-formed; {counts['local']} local reference(s) resolve, "
+                              f"{counts['remote']} remote not fetched; {len(sheets)} stylesheet(s) scanned")
+
+
+# -- content tier ---------------------------------------------------------------
+
+TALK_CHILDREN = (("p", "talk-meta"), ("h2", None), ("p", "speaker"), (None, "cols"), ("p", "takeaway"), ("aside", "notes"))
+TALK_CHILDREN_TEXT = "p.talk-meta, h2, p.speaker, .cols, p.takeaway, aside.notes"
+TEXT_REQUIRED = (0, 1, 2, 4)
+PLACEHOLDER = re.compile(r"\[[^\[\]]+\]")
+SPEAKER_SEP = " \u2014 "
+MD_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+MD_H4 = re.compile(r"^ {0,3}####(?!#)[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$")
+MD_INLINE_LINK = re.compile(r"""\]\(\s*<?([^)\s>]+)>?(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)""")
+MD_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.\-]*:[^>\s]+)>")
+MD_REFDEF = re.compile(r"^ {0,3}\[[^\]]+\]:\s*<?([^\s>]+)>?")
+EXTERNAL = re.compile(r"^https?://", re.I)
+
+
+def norm(text: str) -> str:
+    """NFC, whitespace runs collapsed. No quote, dash or case folding."""
+    return " ".join(unicodedata.normalize("NFC", text).split())
+
+
+def parse_sources(text: str) -> tuple[list[tuple[str, str, int]], set[str]]:
+    """'#### <title> — <speaker>' entries (split on the last ' — ') and every link
+    target, outside fenced code blocks."""
+    entries, urls, fence = [], set(), None
+    for number, line in enumerate(text.splitlines(), 1):
+        m = MD_FENCE.match(line)
+        if m:
+            mark = m.group(1)
+            if fence is None:
+                fence = mark
+            elif mark[0] == fence[0] and len(mark) >= len(fence):
+                fence = None
+            continue
+        if fence:
+            continue
+        h = MD_H4.match(line)
+        if h:
+            heading = norm(html.unescape(h.group(1)))
+            if SPEAKER_SEP in heading:
+                title, speaker = heading.rsplit(SPEAKER_SEP, 1)
+                entries.append((title, speaker, number))
+        for rx in (MD_INLINE_LINK, MD_AUTOLINK):
+            urls.update(html.unescape(u) for u in rx.findall(line))
+        r = MD_REFDEF.match(line)
+        if r:
+            urls.add(html.unescape(r.group(1)))
+    return entries, urls
+
+
+def child_matches(node: Node, want: tuple[str | None, str | None]) -> bool:
+    tag, cls = want
+    return (tag is None or node.tag == tag) and (cls is None or cls in node.classes())
+
+
+def tier_content() -> dict:
+    """The AGENTS.md conventions: talk slide shape, a sources.md entry for every talk
+    speaker, and every external Resources link present in sources.md."""
+    try:
+        source = read_repo_text(DECK_REL)
+    except (OSError, UnicodeDecodeError) as e:
+        raise TierError(f"precondition: {DECK_REL} is unreadable ({e}); run tier-static") from None
+    parser = parse_deck(source)
+    if parser.problems:
+        raise TierError(f"precondition: {DECK_REL} is not well-formed ({len(parser.problems)} structural problem(s), "
+                        f"first at {where(parser.problems[0])}); run tier-static")
+    found: list[dict] = []
+    entries: list = []
+    urls: set = set()
+    try:
+        entries, urls = parse_sources(read_repo_text(SOURCES_REL))
+    except FileNotFoundError:
+        found.append(violation(SOURCES_REL, 1, f"{SOURCES_REL} is missing; talk speakers and Resources links are checked against it"))
+    except UnicodeDecodeError as e:
+        found.append(utf8_violation(SOURCES_REL, e))
+    exact = {(t, s) for t, s, _ in entries}
+
+    sections = [n for n in parser.document.walk() if n.tag == "section"]
+    themes = {c for n in sections if "divider" in n.classes() for c in n.classes() if c != "divider"}
+    talks = [n for n in sections if "talk" in n.classes()]
+    matched = skipped = 0
+    for sec in talks:
+        others = [c for c in sec.classes() if c != "talk"]
+        if len(others) != 1:
+            found.append(violation(DECK_REL, sec.line, f'talk slide class="{sec.attrs.get("class")}" must be '
+                                                        '"talk <theme>" with exactly one theme', sec.column))
+        elif others[0] not in themes:
+            found.append(violation(DECK_REL, sec.line, f"talk slide theme '{others[0]}' has no "
+                                                        f"section.divider {others[0]} in the deck", sec.column))
+        loose = next((c for c in sec.children if isinstance(c, str) and c.strip(HTML_SPACE)), None)
+        if loose is not None:
+            found.append(violation(DECK_REL, sec.line, f"talk slide has text outside its child elements: "
+                                                        f"{clip(norm(loose), 60)!r}", sec.column))
+        kids = sec.elements()
+        if len(kids) != len(TALK_CHILDREN) or not all(child_matches(k, w) for k, w in zip(kids, TALK_CHILDREN)):
+            found.append(violation(DECK_REL, sec.line, f"talk slide children are {', '.join(k.label() for k in kids) or 'none'}; "
+                                                        f"expected {TALK_CHILDREN_TEXT} in that order", sec.column))
+            continue
+        for i in TEXT_REQUIRED:
+            if not norm(kids[i].text()):
+                found.append(violation(DECK_REL, kids[i].line, f"{kids[i].label()} is empty; "
+                                                                "use a placeholder such as [Point] while in progress", kids[i].column))
+        title, speaker = norm(kids[1].text()), norm(kids[2].text())
+        if not title or not speaker:
+            continue
+        if PLACEHOLDER.fullmatch(title) or PLACEHOLDER.fullmatch(speaker):
+            skipped += 1
+            continue
+        if (title, speaker) in exact:
+            matched += 1
+            continue
+        hint = next((f"; sources.md:{n} has this speaker under a different title" for t, s, n in entries if s == speaker), "")
+        found.append(violation(DECK_REL, kids[2].line, f"'{title}' by '{speaker}' has no matching "
+                                                        f"'#### <title>{SPEAKER_SEP}<speaker>' entry in sources.md{hint}",
+                               kids[2].column))
+
+    resources = [n for n in sections if any(c.tag == "h2" and norm(c.text()) == "Resources" for c in n.elements())]
+    links = linked = 0
+    if not resources:
+        found.append(violation(DECK_REL, 1, "no Resources slide: expected one section whose h2 reads 'Resources'"))
+    elif len(resources) > 1:
+        for sec in resources:
+            found.append(violation(DECK_REL, sec.line, "more than one Resources slide; the convention names one", sec.column))
+    else:
+        for a in resources[0].walk():
+            href = (a.attrs.get("href") or "").strip(HTML_SPACE) if a.tag == "a" else ""
+            if not EXTERNAL.match(href):
+                continue
+            links += 1
+            if href in urls:
+                linked += 1
+            else:
+                found.append(violation(DECK_REL, a.line, f"Resources link {href} is not in sources.md; "
+                                                          "add the source there first", a.column))
+    found.sort(key=lambda v: (v["file"] != DECK_REL, v["file"], v["line"], v.get("column", 0)))
+    ok = (f"{len(talks)} talk slides in order; {matched} speaker entries matched"
+          + (f", {skipped} placeholder slide(s) skipped" if skipped else "")
+          + f"; {linked}/{links} Resources links in sources.md")
+    return violations_outcome("content", found, ok)
+
+
+# -- tier subcommands -----------------------------------------------------------
+
+def run_tier(name: str, check) -> int:
+    try:
+        outcome = check()
+    except TierError as e:
+        outcome = {"verdict": "error", "detail": scrub(str(e), STAGE_DETAIL_MAX),
+                   "feedback": {"summary": scrub(f"{name} tier could not judge the deck: {e}", FB_SUMMARY_MAX)}}
+    except Exception as e:  # noqa: BLE001
+        outcome = {"verdict": "error", "detail": scrub(f"crashed: {type(e).__name__}", STAGE_DETAIL_MAX),
+                   "feedback": {"summary": scrub(f"{name} tier crashed: {type(e).__name__}: {e}", FB_SUMMARY_MAX)}}
+    target = os.environ.get(RESULT_ENV)
+    if target:
+        try:
+            write_json_atomic(Path(target), {"tier": name, **outcome})
+        except OSError as e:
+            print(ascii_safe(f"TIER {name}: ERROR cannot write result record: {e}"), file=sys.stderr)
+            return 2
+    lines = [f"TIER {name}: {outcome['verdict'].upper()} - {outcome.get('detail', '')}"]
+    fb = outcome.get("feedback")
+    if fb:
+        lines.append(fb["summary"])
+        if fb.get("details"):
+            lines.append(fb["details"])
+    print(clip(ascii_safe("\n".join(lines)), TIER_TEXT_MAX))
+    return EXIT_CODES[outcome["verdict"]]
+
+
+# -- verify ---------------------------------------------------------------------
+
+def verify_plan(decl: dict, quick: bool) -> tuple[str, list[dict], dict]:
+    """Tiers, profile and budgets exactly as declared. Declared features this
+    harness does not implement are errors, never silently ignored."""
+    v = decl.get("verify")
+    if not isinstance(v, dict):
+        raise Preflight("the declaration has no verify object")
+    if v.get("preconditions"):
+        raise Preflight("verify.preconditions are declared but this harness does not run them")
+    tiers = v.get("tiers")
+    if not isinstance(tiers, list) or not tiers:
+        raise Preflight("verify.tiers is empty or not an array")
+    plan, ids = [], []
+    for i, t in enumerate(tiers):
+        at = f"verify.tiers[{i}]"
+        if not isinstance(t, dict):
+            raise Preflight(f"{at} is not an object")
+        tid, cost, cmd = t.get("id"), t.get("cost_class"), t.get("command")
+        if not isinstance(tid, str) or not TIER_ID.match(tid) or tid in ids:
+            raise Preflight(f"{at}.id is missing, malformed or repeated")
+        if cost not in COST_CLASSES:
+            raise Preflight(f"{at}.cost_class {cost!r} is not one of {', '.join(COST_CLASSES)}")
+        if not (isinstance(cmd, list) and cmd and all(isinstance(a, str) and a for a in cmd)):
+            raise Preflight(f"{at}.command is not a non-empty string array")
+        timeout = t.get("timeout_seconds", DEFAULT_TIER_TIMEOUT)
+        details_max = t.get("feedback_max_chars", FB_DETAILS_MAX)
+        for key, value, floor in (("timeout_seconds", timeout, 1), ("feedback_max_chars", details_max, 200)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < floor:
+                raise Preflight(f"{at}.{key} must be an integer >= {floor}")
+        if t.get("skippable"):
+            raise Preflight(f"{at}.skippable is declared but this harness has no skip logic")
+        if t.get("flaky_reruns"):
+            raise Preflight(f"{at}.flaky_reruns is declared but this harness has no rerun policy")
+        ids.append(tid)
+        plan.append({"id": tid, "cost_class": cost, "command": cmd, "timeout": timeout,
+                     "details_max": min(details_max, FB_DETAILS_MAX)})
+    profiles = v.get("profiles", {})
+    if not isinstance(profiles, dict):
+        raise Preflight("verify.profiles is not an object")
+    if quick:
+        chosen = profiles.get("quick")
+        if not isinstance(chosen, list) or not chosen:
+            raise Preflight("--quick was requested but verify.profiles.quick is not declared")
+        unknown = [x for x in chosen if x not in ids]
+        if unknown:
+            raise Preflight(f"verify.profiles.quick names undeclared tier(s) {unknown}")
+        if [x for x in ids if x in chosen] != chosen:
+            raise Preflight("verify.profiles.quick is not a subsequence of the declared tier order")
+        profile, plan = "quick", [t for t in plan if t["id"] in chosen]
+    else:
+        profile = "full"
+    budgets = v.get("budgets")
+    if not isinstance(budgets, dict):
+        raise Preflight("verify.budgets is not declared")
+    unenforced = [k for k in ("max_cost_usd", "max_wall_clock_seconds") if k in budgets]
+    if unenforced:
+        raise Preflight(f"verify.budgets.{unenforced[0]} is declared but this harness does not enforce it")
+    caps = {}
+    for key, name, required in (("max_attempts_total", "max_total", True), ("max_attempts_per_tier", "per_tier", False)):
+        value = budgets.get(key)
+        if value is None and not required:
+            caps[name] = None
+        elif not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise Preflight(f"verify.budgets.{key} must be an integer >= 1")
+        else:
+            caps[name] = value
+    return profile, plan, caps
+
+
+def state_root(decl: dict) -> Path:
+    rel = decl.get("state", {}).get("dir", DEFAULT_STATE_DIR)
+    target = repo_relative(rel)
+    if target is None:
+        raise Preflight(f"state.dir {rel!r} must be repo-relative and stay inside the repo")
+    return target
+
+
+def tree_identity() -> tuple[str, str]:
+    """(HEAD, content hash of HEAD + tracked diff + untracked non-ignored files)."""
+    if shutil.which("git") is None:
+        raise Preflight("git is not on PATH; the verdict cache key needs it")
+
+    def out(*args: str) -> bytes:
+        try:
+            proc = git(*args)
+        except subprocess.TimeoutExpired:
+            raise Preflight(f"git {args[0]} did not answer within {GIT_TIMEOUT}s") from None
+        if proc.returncode != 0:
+            raise Preflight(f"git {args[0]} failed: {proc.stderr.decode('utf-8', 'replace').strip()[:200]}")
+        return proc.stdout
+
+    head = out("rev-parse", "--verify", "HEAD").strip()
+    diff = out("diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv", "--no-color")
+    untracked = sorted(p for p in out("ls-files", "-z", "--others", "--exclude-standard").split(b"\0") if p)
+    h = hashlib.sha256()
+
+    def feed(tag: bytes, data: bytes) -> None:
+        h.update(tag + b"\0" + str(len(data)).encode() + b"\0" + data)
+
+    feed(b"head", head)
+    feed(b"diff", diff)
+    for name in untracked:
+        feed(b"path", name)
+        try:
+            feed(b"blob", hashlib.sha256((ROOT / os.fsdecode(name)).read_bytes()).digest())
+        except OSError:
+            feed(b"unreadable", b"")
+    return head.decode("ascii"), h.hexdigest()
+
+
+def cache_key(tree: str, profile: str, decl_raw: bytes) -> str:
+    parts = {"tree": tree, "profile": profile,
+             "declaration": hashlib.sha256(decl_raw).hexdigest(),
+             "harness": hashlib.sha256((ROOT / HARNESS_REL).read_bytes()).hexdigest(),
+             "python": platform.python_version()}
+    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
+
+
+def load_cached(path: Path, profile: str, tree: str) -> dict | None:
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    ok = (isinstance(doc, dict) and doc.get("schema_version") == TARGET_SCHEMA and doc.get("mode") == "real"
+          and doc.get("profile") == profile and isinstance(doc.get("stages"), list) and doc["stages"]
+          and doc.get("verdict") in EXIT_CODES and doc.get("exit_code") == EXIT_CODES[doc["verdict"]]
+          and isinstance(doc.get("cache"), dict) and doc["cache"].get("tree_hash") == tree
+          and isinstance(doc["cache"].get("recorded_at"), str))
+    return doc if ok else None
+
+
+def bounded_feedback(raw, details_max: int) -> dict | None:
+    if not isinstance(raw, dict) or not isinstance(raw.get("summary"), str) or not raw["summary"].strip():
+        return None
+    fb = {"summary": clip(raw["summary"], FB_SUMMARY_MAX)}
+    if isinstance(raw.get("details"), str) and raw["details"]:
+        fb["details"] = clip(raw["details"], details_max)
+    locations = []
+    for v in raw.get("locations") if isinstance(raw.get("locations"), list) else []:
+        if not (isinstance(v, dict) and isinstance(v.get("file"), str) and isinstance(v.get("message"), str)):
+            continue
+        loc = {"file": v["file"]}
+        for key in ("line", "column"):
+            if isinstance(v.get(key), int) and not isinstance(v[key], bool) and v[key] >= 1:
+                loc[key] = v[key]
+        loc["message"] = clip(v["message"], FB_MESSAGE_MAX)
+        locations.append(loc)
+        if len(locations) == FB_LOCATIONS_MAX:
+            break
+    if locations:
+        fb["locations"] = locations
+    return fb
+
+
+def run_stage(tier: dict, state: Path, run_id: str) -> tuple[dict, dict | None, bool]:
+    """Run one declared tier argv. Returns (stage, feedback, cacheable)."""
+    tid, argv = tier["id"], tier["command"]
+    log_name = f"{run_id}-{tid}.log"
+    result = state / "verify" / "tmp" / f"{run_id}-{tid}.json"
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.unlink(missing_ok=True)
+    started = time.monotonic()
+
+    def finish(verdict, detail, feedback, cacheable=True, stdout=b"", stderr=b"", code=None):
+        stage = {"id": tid, "cost_class": tier["cost_class"], "verdict": verdict,
+                 "duration_ms": elapsed_ms(started), "detail": clip(detail, STAGE_DETAIL_MAX)}
+        logs = state / "verify" / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / log_name).write_bytes(f"argv: {argv}\nexit: {code}\nverdict: {verdict}\n--- stdout ---\n".encode()
+                                      + (stdout or b"") + b"\n--- stderr ---\n" + (stderr or b""))
+        if feedback is not None:
+            feedback["raw_refs"] = [f"verify/logs/{log_name}"]
+        return stage, feedback, cacheable
+
+    def tail(stdout: bytes, stderr: bytes) -> str:
+        text = ((stdout or b"") + b"\n" + (stderr or b"")).decode("utf-8", "replace").strip()
+        return text[-tier["details_max"]:] if text else "(no output)"
+
+    exe = shutil.which(argv[0])
+    if exe is None:
+        return finish("error", f"'{argv[0]}' not found on PATH",
+                      {"summary": f"tier '{tid}' could not start: '{argv[0]}' does not resolve on PATH; "
+                                  "a harness error, not a verdict on the deck"}, cacheable=False)
+    env = {**os.environ, RESULT_ENV: str(result), "PYTHONDONTWRITEBYTECODE": "1"}
+    try:
+        proc = subprocess.run([exe, *argv[1:]], cwd=ROOT, capture_output=True, stdin=subprocess.DEVNULL,
+                              env=env, timeout=tier["timeout"])
+    except subprocess.TimeoutExpired as e:
+        return finish("error", f"timed out after {tier['timeout']}s",
+                      {"summary": f"tier '{tid}' did not finish within its declared timeout_seconds={tier['timeout']}; "
+                                  "a timeout is a harness error, not a verdict on the deck",
+                       "details": tail(e.stdout, e.stderr)}, False, e.stdout, e.stderr)
+    except OSError as e:
+        return finish("error", "failed to start",
+                      {"summary": scrub(f"tier '{tid}' failed to start: {e.strerror or e}", FB_SUMMARY_MAX)}, False)
+
+    try:
+        record = json.loads(result.read_text(encoding="utf-8"))
+        result.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        record = None
+    if not isinstance(record, dict) or record.get("verdict") not in EXIT_CODES or not isinstance(record.get("detail", ""), str):
+        record = None
+    code, out_tail = proc.returncode, tail(proc.stdout, proc.stderr)
+    claimed = VERDICT_BY_EXIT.get(code)
+    if claimed is None:
+        problem = f"exited {code}, outside the tier contract 0/1/2"
+    elif record is None:
+        problem = f"exited {code} without a valid result record (a crash, or not a tier command)"
+    elif record["verdict"] != claimed:
+        problem = f"exited {code} but its result record says {record['verdict']}"
+    else:
+        fb = bounded_feedback(record.get("feedback"), tier["details_max"])
+        if claimed != "pass" and fb is None:
+            fb = {"summary": clip(f"tier '{tid}' {claimed}ed without feedback; output tail: {out_tail[-300:]}", FB_SUMMARY_MAX),
+                  "details": out_tail}
+        return finish(claimed, record.get("detail") or claimed, fb if claimed != "pass" else None,
+                      True, proc.stdout, proc.stderr, code)
+    return finish("error", problem,
+                  {"summary": clip(f"tier '{tid}' {problem}; treated as a harness error, not a verdict on the deck",
+                                   FB_SUMMARY_MAX), "details": out_tail},
+                  True, proc.stdout, proc.stderr, code)
+
+
+def prune_logs(state: Path) -> None:
+    try:
+        logs = sorted((state / "verify" / "logs").glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in logs[LOGS_KEPT:]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def load_ledger(path: Path, head: str) -> tuple[dict, bool]:
+    fresh = {"task": f"HEAD {head}", "attempts": [], "wall_clock_ms": 0}
+    if not path.exists():
+        return fresh, False
+    try:
+        ledger = json.loads(path.read_text(encoding="utf-8"))
+        ok = (isinstance(ledger, dict) and isinstance(ledger.get("attempts"), list)
+              and isinstance(ledger.get("wall_clock_ms"), int)
+              and all(isinstance(a, dict) and isinstance(a.get("tree_hash"), str) and isinstance(a.get("runs"), dict)
+                      for a in ledger["attempts"]))
+    except (OSError, ValueError):
+        ok = False
+    return (ledger, False) if ok else (fresh, True)
+
+
+def join_bounded(head: str, tail: str, limit: int) -> str:
+    tail = clip(tail, limit - 200 if head else limit)
+    room = limit - len(tail) - 2
+    return f"{clip(head, room)}\n\n{tail}" if head and room > 3 else tail
+
+
+def account_attempt(state: Path, head: str, tree: str, profile: str, verdict: str, failed: str | None,
+                    feedback: dict | None, recorded_at: str, duration_ms: int, caps: dict,
+                    details_max: int) -> tuple[dict, dict]:
+    """Record this fresh run in the task ledger; return (attempt, budget). On a
+    non-pass, the budget state (and, when exhausted, every earlier attempt) is
+    appended to the feedback."""
+    path = state / "verify" / "attempts" / f"{head}.json"
+    ledger, reset = load_ledger(path, head)
+    attempts = ledger["attempts"]
+    entry = next((a for a in attempts if a["tree_hash"] == tree), None)
+    if entry is None:
+        entry = {"tree_hash": tree, "runs": {}}
+        attempts.append(entry)
+    entry["runs"][profile] = {"verdict": verdict, "failed_stage": failed, "recorded_at": recorded_at,
+                              "summary": clip(feedback["summary"], 300) if feedback else ""}
+    ledger["wall_clock_ms"] += duration_ms
+    write_json_atomic(path, ledger)
+
+    number, used = attempts.index(entry) + 1, len(attempts)
+    tier_fails = Counter(stage for a in attempts
+                         for stage in {r.get("failed_stage") for r in a["runs"].values()
+                                       if isinstance(r, dict) and r.get("verdict") == "fail"} if stage)
+    max_total, per_tier = caps["max_total"], caps["per_tier"]
+    reasons = []
+    if verdict != "pass":
+        if used >= max_total:
+            reasons.append(f"{used} of {max_total} attempts used")
+        if verdict == "fail" and per_tier and tier_fails[failed] >= per_tier:
+            reasons.append(f"tier {failed} failed on {tier_fails[failed]} of {per_tier} allowed tree states")
+    if feedback is not None:
+        line = f"budget: this tree is attempt {number}; {used} of {max_total} attempts used for task HEAD {head[:12]}"
+        if verdict == "fail" and per_tier:
+            line += f"; tier {failed} has failed on {tier_fails[failed]} of {per_tier} allowed tree states"
+        if reset:
+            line += "; the attempt ledger was unreadable and was reset"
+        extra = [line]
+        if reasons:
+            feedback["summary"] = clip(f"BUDGET EXHAUSTED ({'; '.join(reasons)}): stop and escalate. {feedback['summary']}",
+                                       FB_SUMMARY_MAX)
+            extra.append("Accumulated evidence:")
+            for i, a in enumerate(attempts, 1):
+                for prof, r in sorted(a["runs"].items()):
+                    extra.append(f"attempt {i} tree {a['tree_hash'][:12]} {prof}: {r.get('verdict')}"
+                                 + (f" at {r['failed_stage']}" if r.get("failed_stage") else "")
+                                 + (f": {r['summary']}" if r.get("summary") else ""))
+        feedback["details"] = join_bounded(feedback.get("details", ""), "\n".join(extra), details_max)
+    attempt = {"number": number, "max_total": max_total, "exhausted": bool(reasons)}
+    budget = {"attempts_used_total": used, "wall_clock_used_seconds": ledger["wall_clock_ms"] // 1000}
+    return attempt, budget
+
+
+def pipeline_error(started_at: str, start: float, ctx: dict, message: str) -> dict:
+    duration = elapsed_ms(start)
+    doc = {"schema_version": TARGET_SCHEMA, "id": new_id(), "target": "working tree", "mode": "real",
+           "verdict": "error", "profile": ctx["profile"]}
+    if ctx.get("profile_tiers"):
+        doc["profile_tiers"] = ctx["profile_tiers"]
+    doc.update({
+        "stages": [{"id": PIPELINE_STAGE, "cost_class": "static", "verdict": "error", "duration_ms": duration,
+                    "detail": scrub(message, STAGE_DETAIL_MAX)}],
+        "failed_stage": PIPELINE_STAGE,
+        "feedback": {"summary": scrub(f"verify could not run: {message}", FB_SUMMARY_MAX),
+                     "details": "No declared tier ran. The 'pipeline' stage is verify's own setup, not a declared tier, "
+                                "and attempt.number/max_total are not budget evidence: attempt accounting was not reached."},
+        "attempt": {"number": 1, "max_total": ctx.get("max_total") or 1},
+        "started_at": started_at, "duration_ms": duration, "exit_code": EXIT_CODES["error"],
+    })
+    return doc
+
+
+def emit(doc: dict, as_json: bool) -> int:
+    if as_json:
+        print(json.dumps(doc))
+        return doc["exit_code"]
+    cache = doc.get("cache", {})
+    replay = f" (replayed; recorded {cache['recorded_at']})" if cache.get("replayed") else ""
+    lines = [f"verify: profile {doc['profile']} [{', '.join(doc.get('profile_tiers', [])) or 'unknown'}]{replay}"]
+    for s in doc["stages"]:
+        lines.append(f"  {s['id']:<10} {s['verdict'].upper():<5} {s['duration_ms']:>6}ms  {s.get('detail', '')}")
+    a = doc["attempt"]
+    lines.append(f"attempt {a['number']} (max {a['max_total']})" + (" - BUDGET EXHAUSTED" if a.get("exhausted") else ""))
+    fb = doc.get("feedback")
+    if fb:
+        lines.append(fb["summary"])
+        locations = fb.get("locations", [])
+        lines += [f"  {where(v)}: {v['message']}" for v in locations[:5]]
+        if len(locations) > 5:
+            lines.append(f"  ... {len(locations) - 5} more location(s); --json has them all")
+        lines += [f"  raw log (state dir): {ref}" for ref in fb.get("raw_refs", [])]
+    last = f"VERDICT: {doc['verdict'].upper()}"
+    print(clip(ascii_safe("\n".join(lines)), VERIFY_TEXT_MAX - len(last) - 1) + "\n" + last)
+    return doc["exit_code"]
+
+
+def verify(quick: bool, as_json: bool, no_cache: bool) -> int:
+    started_at, start = now_ms(), time.monotonic()
+    ctx = {"profile": "quick" if quick else "full", "profile_tiers": None, "max_total": None}
+    try:
+        return run_verify(started_at, start, ctx, quick, as_json, no_cache)
+    except Preflight as e:
+        return emit(pipeline_error(started_at, start, ctx, str(e)), as_json)
+    except Exception as e:  # noqa: BLE001
+        return emit(pipeline_error(started_at, start, ctx, f"verify crashed: {type(e).__name__}: {e}"), as_json)
+
+
+def run_verify(started_at: str, start: float, ctx: dict, quick: bool, as_json: bool, no_cache: bool) -> int:
+    decl, raw, decl_check = load_declaration()
+    if decl is None:
+        raise Preflight(f"{DECL_REL} is unusable: {decl_check.get('detail') or decl_check['found']}")
+    profile, tiers, caps = verify_plan(decl, quick)
+    ctx.update(profile=profile, profile_tiers=[t["id"] for t in tiers], max_total=caps["max_total"])
+    state = state_root(decl)
+    head, tree = tree_identity()
+    cache_file = state / "verify" / "cache" / f"{cache_key(tree, profile, raw)}.json"
+
+    if not no_cache:
+        cached = load_cached(cache_file, profile, tree)
+        if cached is not None:
+            cached.update(id=new_id(), started_at=started_at, duration_ms=elapsed_ms(start))
+            cached["cache"] = {"replayed": True, "tree_hash": tree, "recorded_at": cached["cache"]["recorded_at"]}
+            return emit(cached, as_json)
+
+    run_id = new_id()
+    stages, verdict, failed, feedback, cacheable, details_max = [], "pass", None, None, True, FB_DETAILS_MAX
+    for tier in tiers:
+        stage, fb, stage_cacheable = run_stage(tier, state, run_id)
+        stages.append(stage)
+        if stage["verdict"] != "pass":
+            verdict, failed, feedback, cacheable, details_max = stage["verdict"], tier["id"], fb, stage_cacheable, tier["details_max"]
+            break
+    prune_logs(state)
+    duration = elapsed_ms(start)
+    attempt, budget = account_attempt(state, head, tree, profile, verdict, failed, feedback, started_at, duration,
+                                      caps, details_max)
+    doc = {"schema_version": TARGET_SCHEMA, "id": run_id, "target": "working tree", "mode": "real",
+           "verdict": verdict, "profile": profile, "profile_tiers": ctx["profile_tiers"], "stages": stages}
+    if verdict != "pass":
+        doc["failed_stage"], doc["feedback"] = failed, feedback
+    doc.update({"attempt": attempt, "budget": budget,
+                "cache": {"replayed": False, "tree_hash": tree, "recorded_at": started_at},
+                "started_at": started_at, "duration_ms": duration, "exit_code": EXIT_CODES[verdict]})
+    if cacheable:
+        write_json_atomic(cache_file, doc)
+    return emit(doc, as_json)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="harness", description="Kawaiicon deck harness")
     sub = parser.add_subparsers(dest="command", metavar="command", required=True)
     p_doctor = sub.add_parser("doctor", help="check the machine against .claude/harness.json")
     p_doctor.add_argument("--json", action="store_true", help="emit one doctor-report JSON object")
+    p_verify = sub.add_parser("verify", help="run the declared verify tiers and emit a verify-result")
+    p_verify.add_argument("--quick", action="store_true", help="run verify.profiles.quick instead of every tier")
+    p_verify.add_argument("--json", action="store_true", help="emit one verify-result JSON object")
+    p_verify.add_argument("--no-cache", action="store_true", help="run fresh; the result is still cached")
+    sub.add_parser("tier-static", help="index.html well-formed; local href/src and css url()/@import resolve")
+    sub.add_parser("tier-content", help="talk slides, speakers and Resources links agree with sources.md")
     args = parser.parse_args()
+    if args.command == "verify":
+        return verify(args.quick, args.json, args.no_cache)
+    if args.command == "tier-static":
+        return run_tier("static", tier_static)
+    if args.command == "tier-content":
+        return run_tier("content", tier_content)
     try:
         return doctor(args.json)
     except Exception as exc:  # noqa: BLE001

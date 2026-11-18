@@ -38,7 +38,11 @@ jobs:
           python3 ../taniko/schemas/validate.py
           python3 ../taniko/conformance/selftest.py
 
-      # Behavioral tier joins once bin/harness verify exists (Phase 3).
-      - name: Conformance (static tier)
+      - name: Doctor
         working-directory: repo
-        run: python3 ../taniko/conformance/run.py --repo . --tiers static
+        run: python3 bin/harness doctor
+
+      # Destructive checks corrupt and restore index.html; they need the clean checkout.
+      - name: Conformance (static, behavioral, destructive)
+        working-directory: repo
+        run: python3 ../taniko/conformance/run.py --repo . --tiers static,behavioral,destructive
