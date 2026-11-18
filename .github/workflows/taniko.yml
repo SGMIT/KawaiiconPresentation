@@ -38,6 +38,12 @@ jobs:
           python3 ../taniko/schemas/validate.py
           python3 ../taniko/conformance/selftest.py
 
+      # The guard is boundary machinery, not deck content, so its tests run in
+      # CI rather than as a verify tier the deck author would be charged for.
+      - name: Tamper guard tests
+        working-directory: repo
+        run: python3 -m unittest discover -s .claude/hooks -p 'test_*.py' -v
+
       - name: Doctor
         working-directory: repo
         run: python3 bin/harness doctor

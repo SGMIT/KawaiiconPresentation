@@ -9,13 +9,21 @@ fail-closed on parse or declaration errors. No model judgment.
 
 What it matches:
   - file paths from tool payloads (path / file_path / target_file / ...)
-  - path literals embedded in shell command strings
+  - patch bodies: "*** Update|Add|Delete File: <path>" and unified diff
+    "--- a/<path>" / "+++ b/<path>" headers in any tool payload string
+  - shell commands, decided per segment (split on ; && || | & newlines,
+    $( ) and backticks): a segment that names a guarded path denies unless
+    its own leading command is a reader, git metadata, or bin/harness; any
+    redirection (> >> &>) into a guarded path denies; after cd into a
+    guarded directory every non-reader segment denies
+  - unknown tools that name a guarded path deny (fail closed); only known
+    read tools are exempt
   - normalisation: NFC, backslash->slash, strip ./, reject .. escape,
     absolute paths only if under the repo root, os.path.normcase on Windows,
     Path.resolve() once (best-effort; no TOCTOU without an OS sandbox)
 
 What it deliberately does not attempt:
-  - full PowerShell / cmd / bash AST parsing
+  - full PowerShell / cmd / bash AST parsing (quoting, variables, eval)
   - blocking out-of-band writers that never name a path in the tool call
 """
 
@@ -25,6 +33,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from collections import Counter
@@ -39,16 +48,53 @@ ALWAYS_DENY = (".cursor/**",)
 WRITE_TOOLS = {
     "write", "edit", "delete", "editnotebook", "notebookedit",
     "strreplace", "search_replace", "create", "writetofile",
+    "apply_patch", "applypatch", "multiedit", "create_file", "edit_file",
+    "str_replace", "str_replace_editor", "replace_string_in_file",
+    "insert_edit_into_file",
 }
-SHELL_TOOLS = {"shell", "bash", "powershell", "cmd", "terminal"}
+SHELL_TOOLS = {"shell", "bash", "powershell", "cmd", "terminal", "run_in_terminal"}
+READ_TOOLS = {
+    "read", "grep", "glob", "ls", "view", "semanticsearch", "readbytestream",
+    "readfile", "read_file", "readlints", "list_dir", "file_search",
+    "grep_search", "codebase_search",
+}
 
-# Substrings that suggest a shell command will mutate the tree.
+# Substrings that suggest a shell command will mutate the tree. Used only for
+# the soft budget halt; guarded-path decisions do not depend on it.
 WRITE_SHELL_HINTS = (
     ">", ">>", "out-file", "set-content", "add-content", "clear-content",
     "copy-item", "move-item", "remove-item", "ren ", "rename-item",
     "new-item", "ni ", "mi ", "ri ", "cpi ", "echo ", "printf ",
     "tee ", "sed -i", "perl -i", "git checkout", "git restore",
     "git apply", "git reset", "git clean", "git commit", "git add ",
+    "rm ", "mv ", "cp ", "touch ", "chmod ", "ln ", "dd ", "truncate ",
+    "install ", "unlink ", "mkdir ", "rmdir ", "apply_patch",
+)
+
+# Leading commands that only read. A segment led by one of these may name a
+# guarded path; its redirections are still checked.
+READ_COMMANDS = {
+    "cat", "head", "tail", "less", "more", "type", "get-content", "gc",
+    "wc", "grep", "egrep", "fgrep", "rg", "ls", "dir", "stat", "file",
+    "diff", "cmp", "sha256sum", "shasum", "md5", "md5sum", "test", "[",
+    "select-string", "sls", "get-childitem", "gci", "get-item", "gi",
+    "cd", "pushd", "popd", "set-location", "sl", "pwd", "true", ":",
+}
+# git subcommands that do not touch the working tree. add/commit only stage
+# and record what is already on disk. update-index is excluded: it can flip
+# the exec bit or hide changes with skip-worktree.
+GIT_READ_SUBCOMMANDS = {
+    "status", "diff", "log", "show", "rev-parse", "ls-files", "blame",
+    "describe", "branch", "add", "commit",
+}
+CD_COMMANDS = {"cd", "pushd", "set-location", "sl"}
+PYTHONS = {"python", "python3", "py"}
+SEGMENT_SPLIT = re.compile(r"\|\||&&|;|\n|(?<![>|])\|(?!\|)|(?<![<>&])&(?![>&])|\$\(|`|[()]")
+REDIRECT = re.compile(r"(?:\d|&)?>>?\|?\s*(?!&)([^\s;&|<>()]+)")
+PATCH_HEADER = re.compile(
+    r"^(?:\*\*\* (?:Update|Add|Delete) File:|\*\*\* Move to:)\s*(.+?)\s*$"
+    r"|^(?:\+\+\+|---) (?:[ab]/)?(\S+)",
+    re.MULTILINE,
 )
 
 
@@ -172,15 +218,115 @@ PATH_IN_CMD = re.compile(
 )
 
 
-def paths_from_command(command: str) -> list[str]:
-    found: list[str] = []
-    for m in PATH_IN_CMD.finditer(command.replace("\\", "/")):
-        found.append(m.group(1))
-    # Also catch absolute paths that resolve into the repo.
-    for token in re.findall(r"[^\s\"'`]+", command):
-        if "/" in token or "\\" in token or token.endswith((".md", ".json", ".py", ".yml")):
-            found.append(token)
-    return found
+def patch_paths(text: str) -> list[str]:
+    """Target paths named by apply_patch-style or unified-diff headers."""
+    out: list[str] = []
+    for m in PATCH_HEADER.finditer(text):
+        path = (m.group(1) or m.group(2) or "").strip()
+        if path and path != "/dev/null":
+            out.append(path)
+    return out
+
+
+def rel_from(raw: str, cwd: Path) -> str | None:
+    """Repo-relative path for raw, resolved from cwd (relative paths)."""
+    text = raw.strip().strip('"').strip("'").replace("\\", "/")
+    if not text or text.startswith("-"):
+        return None
+    if Path(text).is_absolute() or text.startswith("file:"):
+        return to_repo_relative(text)
+    try:
+        rel = (cwd / text).resolve().relative_to(REPO.resolve())
+    except (ValueError, OSError):
+        return None
+    return None if ".." in rel.parts else rel.as_posix()
+
+
+def guarded_hit(raw: str, cwds: list[Path], globs: list[str]) -> tuple[str, str] | None:
+    for cwd in cwds:
+        rel = rel_from(raw, cwd)
+        if rel is None:
+            continue
+        g = blocked_by(rel, globs)
+        if g:
+            return rel, g
+    return None
+
+
+def segment_tokens(segment: str) -> list[str]:
+    text = segment.replace("\\", "/")
+    try:
+        tokens = shlex.split(text, posix=True)
+    except ValueError:
+        tokens = text.split()
+    while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+        tokens.pop(0)
+    return tokens
+
+
+def leading_is_exempt(tokens: list[str]) -> bool:
+    """True when the segment's own leading command is a reader, git metadata,
+    or a bin/harness run. Applies to that segment only."""
+    if not tokens:
+        return True
+    head = tokens[0].lower()
+    if head.rsplit("/", 1)[-1] in PYTHONS:
+        args = [t for t in tokens[1:] if t != "-3"]
+        return bool(args) and args[0].lstrip("./") == "bin/harness"
+    if head.lstrip("./") == "bin/harness":
+        return True
+    if head == "git":
+        rest = tokens[1:]
+        while rest and rest[0].startswith("-"):
+            flag = rest.pop(0)
+            if flag in ("-C", "-c") and rest:
+                rest.pop(0)
+        return bool(rest) and rest[0].lower() in GIT_READ_SUBCOMMANDS
+    return head in READ_COMMANDS
+
+
+def shell_violation(command: str, start_cwd: Path, globs: list[str]) -> str | None:
+    """Return a deny reason for the first offending segment, else None."""
+    for raw in patch_paths(command):
+        hit = guarded_hit(raw, [start_cwd, REPO], globs)
+        if hit:
+            return f"shell patch body targets {hit[0]} (matches sandbox glob {hit[1]!r})"
+    cwd = start_cwd
+    cwd_guard: str | None = None
+    for segment in SEGMENT_SPLIT.split(command):
+        if not segment.strip():
+            continue
+        cwds = [cwd, REPO] if cwd != REPO else [REPO]
+        for target in REDIRECT.findall(segment):
+            hit = guarded_hit(target, cwds, globs)
+            if hit:
+                return f"shell redirection into {hit[0]} (matches sandbox glob {hit[1]!r})"
+        tokens = segment_tokens(segment)
+        exempt = leading_is_exempt(tokens)
+        if tokens and tokens[0].lower() in CD_COMMANDS:
+            dest = next((t for t in tokens[1:] if not t.startswith("-")), "")
+            rel = rel_from(dest, cwd) if dest else None
+            if rel is None:
+                cwd, cwd_guard = REPO, None
+            else:
+                cwd = REPO / rel
+                g = blocked_by(rel, globs) or blocked_by(rel + "/x", globs)
+                cwd_guard = f"{rel} (matches sandbox glob {g!r})" if g else None
+            continue
+        if exempt:
+            continue
+        if cwd_guard:
+            return f"shell mutation after cd into {cwd_guard}"
+        words = list(tokens)
+        for t in tokens:
+            if "=" in t:
+                words.append(t.split("=", 1)[1])
+        words.extend(m.group(1) for m in PATH_IN_CMD.finditer(segment.replace("\\", "/")))
+        for word in words:
+            hit = guarded_hit(word, cwds, globs)
+            if hit:
+                return f"shell segment {segment.strip()[:80]!r} targets {hit[0]} (matches sandbox glob {hit[1]!r})"
+    return None
 
 
 def command_looks_writey(command: str) -> bool:
@@ -326,57 +472,42 @@ def main() -> int:
     elif isinstance(tool_input.get("command"), str):
         command = tool_input["command"]
 
-    # Collect candidate paths from structured fields and the command string.
-    candidates: list[str] = []
-    walk_strings(tool_input, candidates)
-    walk_strings({k: payload.get(k) for k in ("file_path", "path", "target_file")}, candidates)
-    if command:
-        candidates.extend(paths_from_command(command))
-
-    hit_rel = None
-    hit_glob = None
-    for raw_path in candidates:
-        rel = to_repo_relative(raw_path)
-        if rel is None:
-            continue
-        g = blocked_by(rel, globs)
-        if g:
-            hit_rel, hit_glob = rel, g
-            break
-
     is_write_tool = tool_l in WRITE_TOOLS or tool_l.endswith("write") or tool_l.endswith("edit")
     is_shell = (
         event.lower() in ("beforeshellexecution", "before_shell_execution")
         or tool_l in SHELL_TOOLS
     )
+    read_like = tool_l in READ_TOOLS
+    guard_note = "protected/read_only paths change only via a reviewed human-approved path"
 
-    read_like = tool_l in {"read", "grep", "glob", "semanticsearch", "readbytestream", "readfile"}
-    harness_run = bool(is_shell and re.search(
-        r"(?i)\bpython3?\s+(\.?[/\\])?bin[/\\]harness\b", command,
-    ))
-    git_meta = bool(is_shell and re.search(
-        r"(?i)\bgit\s+(status|diff|log|show|rev-parse|add|commit|update-index|ls-files)\b",
-        command,
-    ))
-    read_shell = bool(is_shell and re.search(
-        r"(?i)\b(type|cat|Get-Content|gc|head|tail|less|more|git\s+show|git\s+diff|git\s+log)\b",
-        command,
-    ))
-    if hit_rel and not read_like:
-        # Structured write tools always deny. Shell: allow harness runs and
-        # git meta even when the argv names a guarded path; deny other writey
-        # or ambiguous shells that mention a guarded path.
-        if is_write_tool or (not tool and not is_shell):
-            return deny(
-                f"refusing mutation of {hit_rel} (matches sandbox glob {hit_glob!r}); "
-                "protected/read_only paths change only via a reviewed human-approved path",
-                event or "PreToolUse",
-            )
-        if is_shell and not (harness_run or git_meta or read_shell):
-            if command_looks_writey(command) or True:
+    if is_shell:
+        cwd = REPO
+        raw_cwd = payload.get("cwd")
+        if isinstance(raw_cwd, str):
+            rel = to_repo_relative(raw_cwd)
+            if rel is not None:
+                cwd = REPO / rel
+        why = shell_violation(command, cwd, globs)
+        if why:
+            return deny(f"refusing {why}; {guard_note}", event or "PreToolUse")
+    elif not read_like:
+        # Structured payloads: explicit path fields plus patch headers in any
+        # string. Unknown tools fail closed when they name a guarded path.
+        strings: list[str] = []
+        walk_strings(tool_input, strings)
+        walk_strings({k: payload.get(k) for k in ("file_path", "path", "target_file")}, strings)
+        candidates = list(strings)
+        for text in strings:
+            candidates.extend(patch_paths(text))
+        for raw_path in candidates:
+            rel = to_repo_relative(raw_path)
+            if rel is None:
+                continue
+            g = blocked_by(rel, globs)
+            if g:
+                kind = "mutation" if (is_write_tool or not tool) else f"unrecognised tool {tool!r} on"
                 return deny(
-                    f"refusing shell that targets {hit_rel} (matches sandbox glob {hit_glob!r}); "
-                    "protected/read_only paths change only via a reviewed human-approved path",
+                    f"refusing {kind} {rel} (matches sandbox glob {g!r}); {guard_note}",
                     event or "PreToolUse",
                 )
 

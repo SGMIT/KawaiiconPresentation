@@ -656,3 +656,68 @@ implies a spec change are marked `file-against-taniko`.
 - `/usr/bin/python3` on this macOS host is 3.9.6, and doctor halts on
   `python3 >=3.10`. Gates were run with Homebrew Python 3.12.7 plus
   `jsonschema` in a venv outside the repo, matching CI (`setup-python 3.12`).
+
+## Correction C1 — Guard bypasses closed (red → green)
+
+### Shell shortcuts exempted the whole command
+
+- **Needed:** a guard that denies any shell command that writes a protected
+  path, even when the command also contains a harmless token.
+- **Offered:** the Phase 4 guard ran `read_shell`, `git_meta` and
+  `harness_run` as regex searches over the whole command string. One
+  benign token (`cat`, `git status`, `python3 bin/harness`) allowed
+  `cat notes.md > bin/harness`, `git status && echo x > CLAUDE.md`,
+  `python3 bin/harness verify; sed -i ... .claude/harness.json` and
+  `cd .claude && rm harness.json`. The suite's textual
+  `tamper-rules-crosscheck` could not see this.
+- **Implemented:** the guard now decides per segment (split on `;` `&&` `||`
+  `|` `&` newlines `$(` backticks and parentheses):
+  - a segment that names a guarded path denies unless its *own* leading
+    command is a reader (`cat`, `grep`, `ls`, ...), git metadata
+    (`status`, `diff`, `log`, `show`, `add`, `commit`, ...) or `bin/harness`;
+  - any redirection (`>`, `>>`, `&>`, `>|`) whose target resolves into a
+    guarded path denies, even after a reader;
+  - `cd`/`pushd`/`Set-Location` is tracked: relative paths resolve from the
+    new directory, and after a cd into a guarded directory every non-reader
+    segment denies.
+- **The `or True` is gone; the writey heuristic no longer decides.** Every
+  non-reader segment that names a guarded path denies. Write hints cannot
+  enumerate writers (`python -c`, `cp`, `find -delete`, `install`, `dd`, ...);
+  a reader allowlist fails closed instead. `WRITE_SHELL_HINTS` now only
+  feeds the soft budget halt, extended with `rm`, `mv`, `cp`, and others.
+- **Tightened:** `git update-index` is no longer exempt (it can flip the exec
+  bit or set skip-worktree on a protected file). Reading a guarded path with
+  a non-allowlisted reader (`sed -n`) is denied.
+
+### Patch-style write tools were unrecognised
+
+- **Needed:** Copilot and Codex `apply_patch` edits are writes.
+- **Offered:** the guard extracted only path-keyed fields; a patch body
+  naming `bin/harness` was allowed, and any unknown tool name fell through
+  to allow.
+- **Implemented:** `*** Update|Add|Delete File:`, `*** Move to:` and unified
+  `--- a/` / `+++ b/` headers are parsed from every payload string (and from
+  shell commands, for heredoc'd patches). `apply_patch` and similar
+  editor tool names are write tools. An unrecognised tool that names a
+  guarded path now denies; only a known read-tool list is exempt.
+
+### Evidence and wiring
+
+- `.claude/hooks/test_tamper_guard.py`: 31 stdlib `unittest` cases that run
+  the guard as a subprocess, as a hook would. Red against `f096ef4`'s guard:
+  15 failures, all defect-1/2 payloads. Green after the fix: 31/31.
+- **Wired as a CI step, not a verify tier.** The guard is boundary machinery,
+  not deck content. A verify tier would charge guard regressions to the deck
+  author's attempt budget, and the author cannot fix them because the guard
+  is protected. The CI step runs on every push and pull request, before
+  doctor.
+
+### Bypass routes that remain open (updated)
+
+- Quoting, variables and indirection are still not parsed
+  (`f=bin/harness; echo x > "$f"`, `eval`, `bash -c "$(...)"`, base64).
+  The guard only sees path literals.
+- `cd` to a variable or to an unresolvable directory resets tracking to the
+  repo root.
+- An unknown tool that writes but never names a path in its payload is still
+  allowed.
