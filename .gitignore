@@ -10,3 +10,6 @@ desktop.ini
 
 # Node (if a local server or tooling is added later)
 node_modules/
+
+# Tāniko harness session state (progress, caches, checkpoints)
+.agent/

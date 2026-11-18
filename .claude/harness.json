@@ -1,0 +1,35 @@
+{
+  "schema_version": "0.4.0",
+  "project": { "name": "kawaiicon-presentation", "description": "Static reveal.js deck summarising Kawaiicon 2026 talks" },
+  "commands": {
+    "doctor": ["python3", "bin/harness", "doctor"],
+    "verify": ["python3", "bin/harness", "verify"],
+    "profiles": { "quick": ["python3", "bin/harness", "verify", "--quick"] },
+    "json_flag": "--json",
+    "no_cache_flag": "--no-cache"
+  },
+  "conformance": { "probe_file": "index.html" },
+  "toolchain": [
+    {
+      "id": "python3",
+      "kind": "runtime",
+      "requirement": ">=3.10",
+      "detect": { "command": ["python3", "--version"], "version_pattern": "Python ([0-9.]+)" },
+      "remediation": "Install Python 3.10+. On Windows, python3 is a Store stub: copy python.exe to python3.exe in the install dir and put that dir ahead of WindowsApps on PATH"
+    }
+  ],
+  "sandbox": {
+    "writable": ["index.html", "css/**", "assets/**", "notes.md", "sources.md"],
+    "read_only": ["README.md", "docs/**"],
+    "protected": [".claude/**", "bin/**", ".github/**", "AGENTS.md", "CLAUDE.md", "TANIKO_VERSION", ".gitignore"]
+  },
+  "state": { "dir": ".agent" },
+  "verify": {
+    "tiers": [
+      { "id": "static", "cost_class": "static", "command": ["python3", "bin/harness", "tier-static"], "timeout_seconds": 30, "expected_seconds": 1 },
+      { "id": "content", "cost_class": "static", "command": ["python3", "bin/harness", "tier-content"], "timeout_seconds": 30, "expected_seconds": 1 }
+    ],
+    "profiles": { "quick": ["static"] },
+    "budgets": { "max_attempts_total": 3, "max_attempts_per_tier": 2 }
+  }
+}
