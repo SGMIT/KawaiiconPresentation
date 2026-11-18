@@ -8,7 +8,8 @@ doctor has two duties (CONTRACTS section 1):
   drift   every .claude/harness.json toolchain[] entry is detected by running its
           declared argv and compared against its declared requirement
   health  the environment is usable right now (declaration, suite pin, git,
-          state dir, disk, probe file, harness line endings)
+          state dir, disk, probe file, harness line endings, tamper-rule
+          alignment against sandbox globs)
 
 Exit codes: 0 ok or warn, 2 drift (a check failed), 1 error (doctor could not
 complete or the declaration contains something doctor cannot evaluate).
@@ -395,6 +396,72 @@ def check_probe_file(rel: str) -> dict:
                  "verify tiers and destructive conformance depend on this file", f"Restore {rel} from git")
 
 
+def check_tamper_rules_aligned(decl: dict) -> dict:
+    """Drift: agent CLI deny/hook adapters must cover sandbox globs.
+
+    Does not prove enforcement. It only checks that .claude/settings.json
+    deny-lists every protected and read_only glob, that the shared guard
+    script exists, and that the Cursor adapter points at it.
+    """
+    req = "settings deny + hooks cover sandbox.protected and sandbox.read_only"
+    sandbox = decl.get("sandbox") if isinstance(decl.get("sandbox"), dict) else {}
+    globs = []
+    for key in ("protected", "read_only"):
+        vals = sandbox.get(key) or []
+        if isinstance(vals, list):
+            globs.extend(g for g in vals if isinstance(g, str))
+    settings_rel = ".claude/settings.json"
+    guard_rel = ".claude/hooks/tamper_guard.py"
+    cursor_rel = ".cursor/hooks.json"
+    settings_path = ROOT / settings_rel
+    if not settings_path.is_file():
+        return check("tamper-rules-aligned", "file", "fail", req, "missing settings",
+                     f"{settings_rel} missing; agent CLI cannot deny-list protected paths",
+                     f"Add {settings_rel} (reviewed) with permissions.deny for each sandbox glob")
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        return check("tamper-rules-aligned", "file", "fail", req, "unparseable settings",
+                     f"{settings_rel}: {e}")
+    deny = []
+    perms = settings.get("permissions") if isinstance(settings, dict) else None
+    if isinstance(perms, dict) and isinstance(perms.get("deny"), list):
+        deny = [x for x in perms["deny"] if isinstance(x, str)]
+    missing = []
+    for g in globs:
+        if f"Edit({g})" not in deny or f"Write({g})" not in deny:
+            missing.append(g)
+    if missing:
+        return check("tamper-rules-aligned", "file", "fail", req, f"{len(missing)} glob(s) uncovered",
+                     "permissions.deny missing Edit/Write for: " + ", ".join(missing[:8]),
+                     f"Update {settings_rel} deny list from sandbox globs in a reviewed change")
+    if not (ROOT / guard_rel).is_file():
+        return check("tamper-rules-aligned", "file", "fail", req, "missing guard",
+                     f"{guard_rel} missing; adapters have nothing portable to invoke",
+                     f"Restore {guard_rel} from git")
+    cursor_path = ROOT / cursor_rel
+    if not cursor_path.is_file():
+        return check("tamper-rules-aligned", "file", "warn", req, "no Cursor adapter",
+                     f"{cursor_rel} missing; Cursor sessions on this repo will not load the shared guard",
+                     f"Add {cursor_rel} invoking {guard_rel} if this team uses Cursor")
+    try:
+        cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        return check("tamper-rules-aligned", "file", "fail", req, "unparseable Cursor hooks",
+                     f"{cursor_rel}: {e}")
+    blob = json.dumps(cursor).replace("\\", "/")
+    if guard_rel not in blob and "run_guard.ps1" not in blob:
+        return check("tamper-rules-aligned", "file", "fail", req, "Cursor hooks miss guard",
+                     f"{cursor_rel} does not reference {guard_rel} or run_guard.ps1",
+                     f"Point Cursor hooks at {guard_rel}")
+    hooks = settings.get("hooks") if isinstance(settings, dict) else None
+    if not isinstance(hooks, dict) or "PreToolUse" not in hooks:
+        return check("tamper-rules-aligned", "file", "warn", req, "no Claude PreToolUse hook",
+                     f"{settings_rel} has deny rules but no PreToolUse hook invoking the shared guard")
+    return check("tamper-rules-aligned", "file", "pass", req,
+                 f"{len(globs)} glob(s) deny-listed; guard + Cursor adapter present")
+
+
 def check_harness_lf() -> dict:
     req = "LF line endings"
     where, data = "index", None
@@ -434,6 +501,8 @@ def run_checks() -> tuple[list[dict], bytes | None, bool]:
             checks.append(check("machine-facts", "other", "error", "machine facts resolvable", "not evaluated",
                                 "machine_facts are declared but this harness has no machine-config layer"))
     checks.append(check_harness_lf())
+    if decl is not None:
+        checks.append(check_tamper_rules_aligned(decl))
     return checks, raw, decl is None
 
 

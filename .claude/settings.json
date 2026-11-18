@@ -1,0 +1,51 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(.claude/**)",
+      "Write(.claude/**)",
+      "Edit(bin/**)",
+      "Write(bin/**)",
+      "Edit(.github/**)",
+      "Write(.github/**)",
+      "Edit(.cursor/**)",
+      "Write(.cursor/**)",
+      "Edit(AGENTS.md)",
+      "Write(AGENTS.md)",
+      "Edit(CLAUDE.md)",
+      "Write(CLAUDE.md)",
+      "Edit(TANIKO_VERSION)",
+      "Write(TANIKO_VERSION)",
+      "Edit(.gitignore)",
+      "Write(.gitignore)",
+      "Edit(README.md)",
+      "Write(README.md)",
+      "Edit(docs/**)",
+      "Write(docs/**)"
+    ],
+    "allow": [
+      "Edit(index.html)",
+      "Write(index.html)",
+      "Edit(css/**)",
+      "Write(css/**)",
+      "Edit(assets/**)",
+      "Write(assets/**)",
+      "Edit(notes.md)",
+      "Write(notes.md)",
+      "Edit(sources.md)",
+      "Write(sources.md)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/tamper_guard.py"
+          }
+        ]
+      }
+    ]
+  }
+}

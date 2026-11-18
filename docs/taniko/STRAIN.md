@@ -537,3 +537,84 @@ implies a spec change are marked `file-against-taniko`.
 - **CI edit:** this phase's `.github/workflows/taniko.yml` change (doctor
   step, then `--tiers static,behavioral,destructive`) is again the reviewed,
   human-approved path and is labelled so in the commit message.
+
+## Phase 4 — Tamper isolation
+
+### `tamper-rules-crosscheck` is textual, not enforcement — `file-against-taniko`
+
+- **Needed:** proof that protected paths cannot be modified by the agent under
+  verification (CONTRACTS §2).
+- **Offered:** `check_tamper_rules` WARNs or PASSes by looking for each
+  protected glob's first path segment as a substring of
+  `.claude/settings.json`. It never loads the agent CLI, never fires a hook,
+  and never attempts a write. A settings file that mentions `.claude` in a
+  comment would PASS.
+- **Implemented:** `.claude/settings.json` with `permissions.deny` Edit/Write
+  for every `sandbox.protected` and `sandbox.read_only` glob (plus allow for
+  writable deck paths), which turns the suite check green. Real enforcement
+  is separate (below). Delta: a conformance check that would prove enforcement
+  would have to drive the agent CLI (or an OS sandbox) and attempt a write;
+  the suite cannot do that from outside today.
+
+### Agnostic core vs per-CLI adapters
+
+- **Needed:** teammates on Cursor, Claude Code, or neither can use the same
+  harness without forking policy.
+- **Offered:** "enforced by the agent CLI's permission layer" with the
+  cross-check hard-coded to `.claude/settings.json` (Claude-shaped).
+- **Implemented:**
+  - **SoT:** `.claude/harness.json` sandbox globs.
+  - **Shared enforcer:** `.claude/hooks/tamper_guard.py` (stdlib, fail-closed,
+    reads the declaration every call). Soft budget halt when the attempt
+    ledger shows exhaustion; human reset is deleting
+    `.agent/verify/attempts/<HEAD>.json`.
+  - **Claude adapter:** `.claude/settings.json` deny list + `PreToolUse` →
+    `python3 .claude/hooks/tamper_guard.py`.
+  - **Cursor adapter:** `.cursor/hooks.json` → `.claude/hooks/run_guard.ps1`
+    (PATH bootstrap + UTF-8 stdin forward on Windows) → same guard.
+  - **Declaration:** `.cursor/**` added to `sandbox.protected` so the Cursor
+    adapter cannot rewrite itself without a reviewed path.
+  - **Drift:** doctor check `tamper-rules-aligned` (not a verify tier).
+
+### Which layers enforce on this machine
+
+- **Cursor (this session):** project hooks enforce when they load and when
+  stdin reaches the guard. `.cursor/permissions.json` is allowlist-only and
+  is not used. Claude `permissions.deny` is not Cursor's deny layer; Cursor
+  may import Claude *hooks* from settings when Third-Party Imports is on.
+- **Claude Code:** would honour `permissions.deny` and `PreToolUse` if used
+  here; not the active CLI for this phase's live proof.
+- **CI:** honours none of the above; runs shell directly. Destructive probe
+  still edits writable `index.html` only.
+- **OS sandbox:** unavailable on this Windows host (Phase 0). Isolation is
+  CLI permission/hook layer only.
+
+### Bypass routes that remain open
+
+- Arbitrary shell that never names a protected path in the tool payload
+  (obfuscated writers, indirection).
+- Full PowerShell/cmd AST is not parsed; only heuristics + path literals.
+- Symlink/junction races (best-effort `Path.resolve()` only).
+- Editing/removing the hook config if the hook fails to load (fail-closed
+  helps only while the adapter is loaded).
+- Deleting `.agent/` resets the budget ledger (must stay writable for doctor).
+- Committing creates a new task identity (HEAD) and resets attempt counting.
+- Raw terminals, humans, and CI outside the agent loop.
+- During this phase, a broken Cursor launcher (`python3` missing from the GUI
+  PATH, or empty stdin when `& python` did not inherit `$input`) fail-closed
+  *every* tool — including repairs to the guard. Recovery required renaming
+  the adapter off. Recorded as operational strain, not a contract win.
+
+### Budget exhaustion: attested + soft hook halt, not OS-enforced
+
+- Phase 3 attested exhaustion in the verify envelope.
+- Phase 4 guard denies mutating Write/Delete and write-like shell when the
+  ledger shows exhaustion. It cannot stop a ledger wipe. Still not
+  OS-enforced.
+
+### Boundary config protection
+
+- Guard and Claude settings live under `.claude/**` (already protected).
+- `.cursor/**` is now in `sandbox.protected` and deny-listed. The declaration
+  can express adapter paths this way; it still cannot express "the hook
+  process must load" — that is CLI behaviour outside the schema.

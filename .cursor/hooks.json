@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": ".claude/hooks/run_guard.ps1",
+        "failClosed": true
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": ".claude/hooks/run_guard.ps1",
+        "failClosed": true
+      }
+    ]
+  }
+}
