@@ -1,0 +1,39 @@
+name: taniko
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout adopting repo
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install suite dependencies
+        run: python3 -m pip install jsonschema
+
+      # The suite judges this repo, so it is cloned outside the checkout
+      # (sibling of repo/, reached as ../taniko) at exactly the pinned tag.
+      - name: Clone Tāniko at pinned tag
+        run: |
+          tag="$(tr -d '[:space:]' < repo/TANIKO_VERSION)"
+          git clone --depth 1 --branch "$tag" https://github.com/gingofthesouth/taniko.git taniko
+          test "$(git -C taniko describe --tags --exact-match)" = "$tag"
+
+      - name: Suite self-gates
+        working-directory: repo
+        run: |
+          python3 ../taniko/schemas/validate.py
+          python3 ../taniko/conformance/selftest.py
