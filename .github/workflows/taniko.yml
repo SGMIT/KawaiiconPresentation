@@ -37,3 +37,8 @@ jobs:
         run: |
           python3 ../taniko/schemas/validate.py
           python3 ../taniko/conformance/selftest.py
+
+      # Behavioral tier joins once bin/harness verify exists (Phase 3).
+      - name: Conformance (static tier)
+        working-directory: repo
+        run: python3 ../taniko/conformance/run.py --repo . --tiers static

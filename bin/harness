@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""Kawaiicon deck harness (Taniko 0.4.0 adapter). Standard library only.
+
+Commands: doctor [--json]
+
+doctor has two duties (CONTRACTS section 1):
+  drift   every .claude/harness.json toolchain[] entry is detected by running its
+          declared argv and compared against its declared requirement
+  health  the environment is usable right now (declaration, suite pin, git,
+          state dir, disk, probe file, harness line endings)
+
+Exit codes: 0 ok or warn, 2 drift (a check failed), 1 error (doctor could not
+complete or the declaration contains something doctor cannot evaluate).
+Usage errors exit 2 with usage on stderr and print no report.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TARGET_SCHEMA = "0.4.0"
+DECL_REL = ".claude/harness.json"
+PIN_REL = "TANIKO_VERSION"
+HARNESS_REL = "bin/harness"
+DEFAULT_STATE_DIR = ".claude/memory"
+TOOL_TIMEOUT = 10
+GIT_TIMEOUT = 10
+DISK_FLOOR_BYTES = 500 * 1000 * 1000
+DISK_FLOOR_LABEL = ">=500MB"
+DETAIL_MAX, REMEDIATION_MAX, SUMMARY_MAX = 500, 300, 1000
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def scrub(text: str, limit: int) -> str:
+    """Strip personal paths and bound length; reports may land in CI logs."""
+    for path, label in ((ROOT, "<repo>"), (Path.home(), "~")):
+        for form in {str(path), path.as_posix()}:
+            text = re.sub(re.escape(form), label, text, flags=re.IGNORECASE)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def check(id_: str, kind: str, status: str, requirement: str, found: str,
+          detail: str = "", remediation: str = "") -> dict:
+    c = {"id": id_, "kind": kind, "status": status, "requirement": requirement, "found": found}
+    if detail:
+        c["detail"] = scrub(detail, DETAIL_MAX)
+    if remediation:
+        c["remediation"] = scrub(remediation, REMEDIATION_MAX)
+    return c
+
+
+# -- node-semver subset ---------------------------------------------------------
+#
+# Supported: exact (1.2.3, =1.2.3, v1.2.3); bare partials as X-ranges (1.2 means
+# >=1.2.0 <1.3.0); comparators >= <= > < = with node semantics for partials
+# (>3.10 means >=3.11.0, <=3.10 means <3.11.0); space-separated comparators are
+# ANDed; || separates alternatives. Anything else raises RangeError.
+
+class RangeError(ValueError):
+    pass
+
+
+_OP_SPACE = re.compile(r"(>=|<=|>|<|=)\s+")
+_COMPARATOR = re.compile(r"^(>=|<=|>|<|=)?v?(.*)$")
+
+
+def _parts(text: str, what: str) -> list[int]:
+    if "-" in text or "+" in text:
+        raise RangeError(f"prerelease/build tags are not supported ({text!r})")
+    pieces = text.split(".")
+    if any(p in ("x", "X", "*") for p in pieces):
+        raise RangeError(f"wildcards (x, X, *) are not supported ({text!r})")
+    if len(pieces) > 3:
+        raise RangeError(f"{what} has more than three components ({text!r})")
+    if not all(p.isdigit() and p.isascii() for p in pieces):
+        raise RangeError(f"{what} is not 1-3 dot-separated integers ({text!r})")
+    return [int(p) for p in pieces]
+
+
+def parse_version(text: str) -> tuple[int, int, int]:
+    parts = _parts(text, "version")
+    return tuple(parts + [0] * (3 - len(parts)))  # type: ignore[return-value]
+
+
+def _comparators(token: str) -> list[tuple[str, tuple[int, int, int]]]:
+    if token.startswith("^"):
+        raise RangeError(f"caret ranges (^) are not supported ({token!r})")
+    if token.startswith("~"):
+        raise RangeError(f"tilde ranges (~) are not supported ({token!r})")
+    if token == "-":
+        raise RangeError("hyphen ranges (a - b) are not supported")
+    if token in ("x", "X", "*"):
+        raise RangeError(f"wildcards (x, X, *) are not supported ({token!r})")
+    m = _COMPARATOR.match(token)
+    op, body = (m.group(1) or "="), m.group(2)
+    if not body:
+        raise RangeError(f"comparator {token!r} has no version")
+    given = _parts(body, "range version")
+    base = tuple(given + [0] * (3 - len(given)))
+    if len(given) == 3:
+        return [("==" if op == "=" else op, base)]
+    upper = (given[0] + 1, 0, 0) if len(given) == 1 else (given[0], given[1] + 1, 0)
+    return {
+        "=": [(">=", base), ("<", upper)],
+        ">=": [(">=", base)],
+        "<": [("<", base)],
+        ">": [(">=", upper)],
+        "<=": [("<", upper)],
+    }[op]
+
+
+def parse_range(requirement: str) -> list[list[tuple[str, tuple[int, int, int]]]]:
+    if not requirement.strip():
+        raise RangeError("requirement is empty")
+    alternatives = []
+    for alt in requirement.split("||"):
+        tokens = _OP_SPACE.sub(r"\1", alt.strip()).split()
+        if not tokens:
+            raise RangeError(f"empty alternative in {requirement!r}")
+        alternatives.append([c for t in tokens for c in _comparators(t)])
+    return alternatives
+
+
+def satisfies(version: tuple[int, int, int], alternatives) -> bool:
+    ops = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b,
+           "<": lambda a, b: a < b, "==": lambda a, b: a == b}
+    return any(all(ops[op](version, bound) for op, bound in alt) for alt in alternatives)
+
+
+# -- drift: declared toolchain vs this machine ----------------------------------
+
+def check_tool(entry: dict) -> dict:
+    tid, req, detect = entry["id"], entry["requirement"], entry["detect"]
+    remediation = entry.get("remediation", "")
+    argv = detect["command"]
+    shown = " ".join(argv)
+    try:
+        alternatives = parse_range(req)
+    except RangeError as e:
+        return check(tid, "tool", "error", req, "not evaluated",
+                     f"requirement {req!r} cannot be evaluated: {e}",
+                     "Declare an exact version or a range doctor supports (>=, <=, >, <, =, space-AND, ||)")
+    try:
+        pattern = re.compile(detect["version_pattern"])
+    except re.error as e:
+        return check(tid, "tool", "error", req, "not evaluated", f"version_pattern is not a valid regex: {e}")
+    if pattern.groups < 1:
+        return check(tid, "tool", "error", req, "not evaluated", "version_pattern has no capture group 1")
+
+    exe = shutil.which(argv[0])
+    if exe is None:
+        return check(tid, "tool", "fail", req, "not found on PATH",
+                     f"'{argv[0]}' does not resolve on PATH", remediation)
+    try:
+        proc = subprocess.run([exe, *argv[1:]], cwd=ROOT, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+                              timeout=TOOL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return check(tid, "tool", "fail", req, "no response",
+                     f"'{shown}' did not finish within {TOOL_TIMEOUT}s", remediation)
+    except OSError as e:
+        return check(tid, "tool", "fail", req, "could not execute",
+                     f"'{shown}' failed to start: {e.strerror or e}", remediation)
+
+    output = proc.stdout + proc.stderr
+    m = pattern.search(output)
+    if not m:
+        first = output.strip().splitlines()[0] if output.strip() else "(no output)"
+        return check(tid, "tool", "fail", req, "unrecognised output",
+                     f"'{shown}' exited {proc.returncode}; version_pattern did not match: {first}",
+                     remediation)
+    raw = m.group(1)
+    try:
+        found = parse_version(raw)
+    except RangeError as e:
+        return check(tid, "tool", "error", req, raw, f"captured version cannot be evaluated: {e}")
+    if satisfies(found, alternatives):
+        return check(tid, "tool", "pass", req, raw)
+    return check(tid, "tool", "fail", req, raw, f"{raw} does not satisfy {req} (from '{shown}')", remediation)
+
+
+# -- health ---------------------------------------------------------------------
+
+def load_declaration() -> tuple[dict | None, bytes | None, dict]:
+    req = f"JSON object, schema_version {TARGET_SCHEMA}"
+    path = ROOT / DECL_REL
+    if not path.is_file():
+        return None, None, check("declaration", "file", "fail", req, "missing",
+                                 f"{DECL_REL} not found; drift cannot be attested without it")
+    raw = path.read_bytes()
+    try:
+        decl = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as e:
+        return None, raw, check("declaration", "file", "fail", req, "unparseable", f"not UTF-8: {e}")
+    except json.JSONDecodeError as e:
+        return None, raw, check("declaration", "file", "fail", req, "unparseable",
+                                f"invalid JSON at line {e.lineno} column {e.colno}: {e.msg}")
+    if not isinstance(decl, dict):
+        return None, raw, check("declaration", "file", "fail", req, type(decl).__name__,
+                                "top level is not an object")
+    version = decl.get("schema_version")
+    if version != TARGET_SCHEMA:
+        return None, raw, check("declaration", "file", "fail", req, f"schema_version {version}",
+                                f"this harness targets schema {TARGET_SCHEMA}",
+                                "Migrate the declaration and bin/harness together in a reviewed change")
+    problems = shape_problems(decl)
+    if problems:
+        return None, raw, check("declaration", "file", "fail", req, "malformed", "; ".join(problems))
+    n = len(decl["toolchain"])
+    return decl, raw, check("declaration", "file", "pass", req,
+                            f"schema_version {version}, {n} toolchain entr{'y' if n == 1 else 'ies'}")
+
+
+def shape_problems(decl: dict) -> list[str]:
+    """Only the fields doctor consumes; full validation is the suite's job."""
+    def is_str(v): return isinstance(v, str)
+    problems = []
+    toolchain = decl.get("toolchain")
+    if not isinstance(toolchain, list):
+        return ["toolchain is not an array"]
+    for i, e in enumerate(toolchain):
+        where = f"toolchain[{i}]"
+        if not isinstance(e, dict):
+            problems.append(f"{where} is not an object")
+            continue
+        for key in ("id", "requirement"):
+            if not is_str(e.get(key)):
+                problems.append(f"{where}.{key} is not a string")
+        d = e.get("detect")
+        if not isinstance(d, dict):
+            problems.append(f"{where}.detect is not an object")
+            continue
+        cmd = d.get("command")
+        if not (isinstance(cmd, list) and cmd and all(is_str(a) for a in cmd)):
+            problems.append(f"{where}.detect.command is not a non-empty string array")
+        if not is_str(d.get("version_pattern")):
+            problems.append(f"{where}.detect.version_pattern is not a string")
+        if "remediation" in e and not is_str(e["remediation"]):
+            problems.append(f"{where}.remediation is not a string")
+    state = decl.get("state", {})
+    if not isinstance(state, dict) or not is_str(state.get("dir", DEFAULT_STATE_DIR)):
+        problems.append("state.dir is not a string")
+    conf = decl.get("conformance", {})
+    if not isinstance(conf, dict) or ("probe_file" in conf and not is_str(conf["probe_file"])):
+        problems.append("conformance.probe_file is not a string")
+    if "machine_facts" in decl and not isinstance(decl["machine_facts"], list):
+        problems.append("machine_facts is not an array")
+    return problems
+
+
+def repo_relative(rel: str) -> Path | None:
+    p = Path(rel)
+    if not rel.strip() or p.is_absolute() or ".." in p.parts:
+        return None
+    target = (ROOT / p).resolve()
+    try:
+        target.relative_to(ROOT)
+    except ValueError:
+        return None
+    return target
+
+
+def git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True,
+                          stdin=subprocess.DEVNULL, timeout=GIT_TIMEOUT)
+
+
+def check_pin() -> dict:
+    req = f"v{TARGET_SCHEMA}"
+    path = ROOT / PIN_REL
+    if not path.is_file():
+        return check("taniko-pin", "file", "fail", req, "missing", f"{PIN_REL} not found")
+    pin = path.read_text(encoding="utf-8", errors="replace").strip()
+    if pin == req:
+        return check("taniko-pin", "file", "pass", req, pin)
+    return check("taniko-pin", "file", "fail", req, pin or "(empty)",
+                 f"{PIN_REL} pins a suite this harness does not target",
+                 "Move TANIKO_VERSION and bin/harness to the same schema version in one reviewed change")
+
+
+def check_git_repo() -> dict:
+    req = "a git repository with at least one commit"
+    if shutil.which("git") is None:
+        return check("git-repo", "resource", "fail", req, "git not on PATH",
+                     "git is required for checkpoints and verdict-cache keys", "Install git and put it on PATH")
+    try:
+        head = git("rev-parse", "--verify", "-q", "HEAD")
+        if head.returncode == 0:
+            return check("git-repo", "resource", "pass", req, f"HEAD {head.stdout.decode().strip()[:7]}")
+        is_repo = git("rev-parse", "--git-dir").returncode == 0
+    except subprocess.TimeoutExpired:
+        return check("git-repo", "resource", "fail", req, "no response", f"git did not answer within {GIT_TIMEOUT}s")
+    if is_repo:
+        return check("git-repo", "resource", "fail", req, "no commits",
+                     "repository has no HEAD commit", "Create an initial commit")
+    return check("git-repo", "resource", "fail", req, "not a git repository",
+                 "repo root is not inside a git work tree", "Run doctor from a git clone of this repo")
+
+
+def check_state_dir(rel: str) -> dict:
+    req = f"{rel} creatable and writable inside the repo"
+    target = repo_relative(rel)
+    if target is None:
+        return check("state-dir", "path", "fail", req, "invalid path",
+                     f"state.dir {rel!r} must be repo-relative and stay inside the repo")
+    probe = target / f".doctor-probe-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        probe.write_bytes(b"doctor")
+        ok = probe.read_bytes() == b"doctor"
+        probe.unlink()
+    except OSError as e:
+        return check("state-dir", "path", "fail", req, "not writable", f"{rel}: {e.strerror or e}",
+                     f"Make {rel} writable by the current user")
+    if not ok:
+        return check("state-dir", "path", "fail", req, "read-back mismatch", f"{rel}: probe content changed")
+    return check("state-dir", "path", "pass", req, f"{rel} writable")
+
+
+def check_state_ignored(rel: str) -> dict:
+    req = f"{rel} gitignored"
+    probe = f"{rel.rstrip('/')}/probe.json"
+    if shutil.which("git") is None:
+        return check("state-dir-ignored", "path", "fail", req, "git not on PATH", "cannot ask git")
+    try:
+        proc = git("check-ignore", "-q", probe)
+    except subprocess.TimeoutExpired:
+        return check("state-dir-ignored", "path", "fail", req, "no response", f"git did not answer within {GIT_TIMEOUT}s")
+    if proc.returncode == 0:
+        return check("state-dir-ignored", "path", "pass", req, "ignored")
+    if proc.returncode == 1:
+        return check("state-dir-ignored", "path", "fail", req, "not ignored",
+                     "session state would be committed, causing merge conflicts and cross-branch leakage",
+                     f"Add {rel.rstrip('/')}/ to .gitignore in a reviewed change")
+    return check("state-dir-ignored", "path", "fail", req, "git error",
+                 proc.stderr.decode("utf-8", "replace").strip())
+
+
+def check_disk() -> dict:
+    free = shutil.disk_usage(ROOT).free
+    found = f"{free / 1e9:.1f} GB free"
+    if free >= DISK_FLOOR_BYTES:
+        return check("disk", "capacity", "pass", DISK_FLOOR_LABEL, found)
+    return check("disk", "capacity", "fail", DISK_FLOOR_LABEL, found,
+                 "the repo volume is nearly full; state and verdict-cache writes will start failing",
+                 "Free disk space on the volume holding this repo")
+
+
+def check_probe_file(rel: str) -> dict:
+    req = f"{rel} present"
+    target = repo_relative(rel)
+    if target is None:
+        return check("probe-file", "file", "fail", req, "invalid path",
+                     f"conformance.probe_file {rel!r} must be repo-relative and stay inside the repo")
+    if target.is_file():
+        return check("probe-file", "file", "pass", req, "present")
+    return check("probe-file", "file", "fail", req, "missing",
+                 "verify tiers and destructive conformance depend on this file", f"Restore {rel} from git")
+
+
+def check_harness_lf() -> dict:
+    req = "LF line endings"
+    where, data = "index", None
+    if shutil.which("git") is not None:
+        try:
+            proc = git("cat-file", "-p", f":{HARNESS_REL}")
+            if proc.returncode == 0:
+                data = proc.stdout
+        except subprocess.TimeoutExpired:
+            pass
+    if data is None:
+        where, data = "working tree", (ROOT / HARNESS_REL).read_bytes()
+    if b"\r\n" not in data:
+        return check("harness-lf", "file", "pass", req, f"LF ({where})")
+    return check("harness-lf", "file", "warn", req, f"CRLF ({where})",
+                 f"{HARNESS_REL} has CRLF in the {where}; ./{HARNESS_REL} fails via the shebang on Linux",
+                 f"Rewrite {HARNESS_REL} with LF and re-add it (git add --renormalize)")
+
+
+# -- doctor ---------------------------------------------------------------------
+
+def run_checks() -> tuple[list[dict], bytes | None, bool]:
+    decl, raw, decl_check = load_declaration()
+    checks = [decl_check]
+    if decl is not None:
+        checks += [check_tool(e) for e in decl["toolchain"]]
+    checks += [check_pin(), check_git_repo()]
+    if decl is not None:
+        state_rel = decl.get("state", {}).get("dir", DEFAULT_STATE_DIR)
+        checks += [check_state_dir(state_rel), check_state_ignored(state_rel)]
+    checks.append(check_disk())
+    if decl is not None:
+        probe_rel = decl.get("conformance", {}).get("probe_file")
+        if probe_rel:
+            checks.append(check_probe_file(probe_rel))
+        if decl.get("machine_facts"):
+            checks.append(check("machine-facts", "other", "error", "machine facts resolvable", "not evaluated",
+                                "machine_facts are declared but this harness has no machine-config layer"))
+    checks.append(check_harness_lf())
+    return checks, raw, decl is None
+
+
+def summarise(status: str, checks: list[dict]) -> str:
+    def brief(c):
+        return f"{c['id']} (required {c['requirement']}, found {c['found']})"
+    bad = [c for c in checks if c["status"] in ("fail", "error")]
+    if status == "ok":
+        text = "environment matches the declaration and is healthy"
+    elif status == "warn":
+        text = "healthy with advisories: " + ", ".join(c["id"] for c in checks if c["status"] == "warn")
+    elif status == "drift":
+        text = ("halt: " + "; ".join(brief(c) for c in bad)
+                + ". Repair the environment or update the declaration in a reviewed change.")
+    else:
+        text = ("halt: doctor could not complete: " + "; ".join(brief(c) for c in bad)
+                + ". Fix the harness or declaration before trusting drift results.")
+    return scrub(text, SUMMARY_MAX)
+
+
+def doctor(as_json: bool) -> int:
+    checks, raw, decl_unusable = run_checks()
+    statuses = {c["status"] for c in checks}
+    if decl_unusable or "error" in statuses:
+        status, code = "error", 1
+    elif "fail" in statuses:
+        status, code = "drift", 2
+    elif "warn" in statuses:
+        status, code = "warn", 0
+    else:
+        status, code = "ok", 0
+    report = {"schema_version": TARGET_SCHEMA, "generated_at": now(), "status": status}
+    if raw is not None:
+        report["declaration"] = {"path": DECL_REL, "sha256": hashlib.sha256(raw).hexdigest()}
+    report["checks"] = checks
+    report["summary"] = summarise(status, checks)
+
+    if as_json:
+        print(json.dumps(report))
+        return code
+    for c in checks:
+        print(ascii_only(f"{c['status'].upper():<5} {c['id']:<18} requirement: {c['requirement']} | found: {c['found']}"))
+        if c["status"] != "pass":
+            for key in ("detail", "remediation"):
+                if c.get(key):
+                    print(ascii_only(f"      {key}: {c[key]}"))
+    counts = ", ".join(f"{sum(c['status'] == s for c in checks)} {s}" for s in ("pass", "warn", "fail", "error"))
+    print(f"DOCTOR: {status.upper()} ({counts})")
+    if status != "ok":
+        print(ascii_only(report["summary"]))
+    return code
+
+
+def ascii_only(text: str) -> str:
+    return text.encode("ascii", "replace").decode("ascii")
+
+
+def internal_error(exc: BaseException, as_json: bool) -> int:
+    detail = scrub(f"{type(exc).__name__}: {exc}", DETAIL_MAX)
+    if as_json:
+        print(json.dumps({"schema_version": TARGET_SCHEMA, "generated_at": now(), "status": "error",
+                          "checks": [{"id": "doctor", "kind": "other", "status": "error", "detail": detail}],
+                          "summary": "doctor crashed before completing; no drift or health result"}))
+    else:
+        print(ascii_only(f"DOCTOR: ERROR (internal) {detail}"), file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="harness", description="Kawaiicon deck harness")
+    sub = parser.add_subparsers(dest="command", metavar="command", required=True)
+    p_doctor = sub.add_parser("doctor", help="check the machine against .claude/harness.json")
+    p_doctor.add_argument("--json", action="store_true", help="emit one doctor-report JSON object")
+    args = parser.parse_args()
+    try:
+        return doctor(args.json)
+    except Exception as exc:  # noqa: BLE001
+        return internal_error(exc, args.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

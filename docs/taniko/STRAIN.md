@@ -154,3 +154,147 @@ implies a spec change are marked `file-against-taniko`.
   reference) leaves out ignored files. An agent able to edit `.gitignore`
   could hide a file from the cache key. This exposure comes from tree-hash
   caching itself, and CONTRACTS §2 does not mention it.
+
+## Phase 2 — Doctor
+
+### The reference doctor takes shortcuts the contract forbids — `file-against-taniko`
+
+- **Needed:** a doctor that detects drift against the committed declaration
+  (CONTRACTS §1): run each `toolchain[].detect.command`, apply its
+  `version_pattern`, compare against its `requirement`.
+- **Offered:** the reference adapter (the README's "specification by
+  example") does none of that. It runs `sys.executable --version` (the
+  interpreter running the harness, not the declared `python3` on PATH, which is
+  exactly the Windows Store-stub failure from Phase 0). It hardcodes the id,
+  `>=3.10`, and the regex, and never reads `toolchain[]`, so a second entry
+  would never be checked. Its comparison handles only major.minor and `>=`, and
+  crashes on `3.13.0rc1`. It hashes the declaration but never parses it or
+  checks `schema_version`, and crashes on a missing or invalid file (exit 1 by
+  traceback). It hardcodes `.agent` instead of reading `state.dir` and never
+  checks it is gitignored. It has no disk check, emits `schema_version`
+  `0.3.0`, and never produces `warn`, `error`, or `remediation`. Its plain-text
+  output drops requirement and remediation, and it silently ignores unknown
+  flags. The suite cannot see any of this: `doctor-runs` checks only the exit
+  code and output size, and `doctor-report-valid` checks only the envelope.
+- **Implemented:** `bin/harness doctor` reads everything from
+  `.claude/harness.json`. Toolchain entries are detected by their declared
+  argv, with no shell and a 10s timeout. Health checks cover declaration
+  (parses, `schema_version` 0.4.0, consumed fields well-typed),
+  `TANIKO_VERSION` pin, git repo with a commit, `state.dir` writable and
+  gitignored, disk >=500MB, `conformance.probe_file` present, and `bin/harness`
+  LF in the index. A missing tool is `fail` with the declared remediation.
+  Delta: fix the reference doctor to be declaration-driven, since adapters
+  copy it.
+
+### Windows `CreateProcess` finds the parent's own interpreter before PATH — `file-against-taniko`
+
+- **Needed:** `detect.command: ["python3", "--version"]` to resolve `python3`
+  the way a shell would, so a Store stub ahead on PATH is caught.
+- **Offered:** "argv, no shell interpretation". On Windows,
+  `subprocess.run(["python3", ...])` goes to `CreateProcess`, which searches
+  the parent executable's directory *before* PATH. Run from
+  `Python312\python3.exe`, a bare `python3` always finds itself, whatever PATH
+  says. A naive declaration-driven doctor would rebuild the reference's
+  `sys.executable` shortcut by accident.
+- **Implemented:** resolve `argv[0]` with `shutil.which` (honours PATH and
+  PATHEXT) and run the resolved path. `found` reports only the version, never
+  the path. The suite's own `Target.run` passes bare argv, so its invocations
+  have the same quirk. Delta: specify that `detect.command[0]` is resolved via
+  PATH lookup, and do so in the suite and reference.
+
+### Range syntax: the schema permits all of node-semver; a stdlib doctor implements a subset — `file-against-taniko`
+
+- **Needed:** a defined meaning for every legal `requirement` value.
+- **Offered:** "Exact version ('5.10.1') or a range in node-semver syntax
+  ('>=20 <21')", i.e. the whole node-semver grammar (caret, tilde, hyphen
+  ranges, X-ranges, prerelease ordering, `||`), with no subset named and no
+  conformance check. Full node-semver is a dependency or several hundred
+  lines; standard-library Python has no semver.
+- **Implemented:** exact versions (`1.2.3`, `=1.2.3`, `v1.2.3`); bare partials
+  as X-ranges (`3.12` means `>=3.12.0 <3.13.0`); `>= <= > < =` with node
+  semantics for partials (`>3.10` means `>=3.11.0`, `<=3.10` means
+  `<3.11.0`); space-AND; `||`. `^`, `~`, hyphen ranges, wildcards,
+  prerelease/build tags, and more than three components are rejected as check
+  status `error` (exit 1) with the construct named, never a silent pass.
+  Delta: the schema should name a portable subset (or a regex for
+  `requirement`), so an adapter's "unsupported" is a declaration error the
+  suite can catch statically rather than a runtime surprise.
+
+### No portable drift-detection invocation; the only evidence of halting is manual — `file-against-taniko`
+
+- **Needed:** proof that doctor halts on drift.
+- **Offered:** the conformance README says so itself: "Doctor drift detection
+  (report a mismatch against a modified declaration) has no portable
+  invocation yet and is exercised only indirectly." `doctor-runs` passes any
+  exit in {0,1,2}, so a doctor that always exits 0 passes.
+- **Implemented:** the only evidence is a manual run. Copy the repo to
+  `%TEMP%`, set the copy's `python3` requirement to `>=99`, run doctor: exit 2,
+  `status: drift`, `python3` FAIL "3.12.10 does not satisfy >=99" with the
+  declared remediation, and both modes schema-valid. Also checked in the copy:
+  a missing detect binary gives exit 2 and `fail` "not found on PATH" with
+  remediation; `^3.10` gives exit 1 and `error`. The committed declaration
+  was never touched. Delta: the suite already has everything it needs for a
+  portable check. Copy the target to a temp dir, rewrite `toolchain[0].requirement`
+  to an unsatisfiable exact version, run `commands.doctor` plus `json_flag`, and
+  require exit 2, `status: drift`, and a failing check whose `id` matches.
+
+### Verify checks PASS vacuously when verify does not exist — `file-against-taniko`
+
+- **Needed:** before Phase 3, every verify check FAILs or SKIPs.
+- **Offered:** with `commands.verify` declared but no `verify` subcommand
+  (argparse exits 2 with usage), `verify-runs` FAILs and `profile-separation`
+  WARNs, but `verify-deterministic` PASSes ("exit 2 twice") and
+  `verify-replay-fast` PASSes ("replays in 0.0s"). Two identical usage errors
+  read as a deterministic, cached verdict.
+- **Implemented:** reported verbatim; not worked around, and no stub verify.
+  Delta: those checks should require a parseable verdict (or exit 0/1)
+  from the first run before judging determinism or replay, and SKIP or FAIL
+  otherwise.
+
+### Exit-code and status precedence are underspecified — `file-against-taniko`
+
+- **Needed:** one exit code when checks both `fail` and `error`, a meaning for
+  check-level `error`, and a code for CLI usage errors.
+- **Offered:** report-level `drift` means "at least one fail" and `error` means
+  "doctor could not complete". The schema does not say which wins when both
+  apply, and does not say whether an unusable declaration is drift or error.
+  `doctor-runs` FAILs any exit outside {0,1,2}, so usage errors cannot get
+  their own code and share 2 with drift.
+- **Implemented:** error > drift > warn > ok. A check `error` (unevaluable
+  requirement, bad regex, uninterpretable capture) or an unusable declaration
+  gives `error` and exit 1, because drift attestation is then untrustworthy.
+  Usage errors exit 2 with usage on stderr and print no JSON, so
+  `--json` callers can still tell them apart. Delta: state precedence in the
+  schema and reserve a usage code (or bless 2 with no JSON).
+
+### Remediation text is static and can contradict the requirement
+
+- **Needed:** remediation that matches the failing requirement.
+- **Offered:** `remediation` is free text beside `requirement`. In the `>=99`
+  drift run, doctor surfaced "Install Python 3.10+", which is correct for the
+  committed declaration but wrong for the mutated one.
+- **Implemented:** surfaced verbatim, as the schema says. Not a spec change. A
+  real requirement bump must update the remediation in the same reviewed
+  commit.
+
+### `core.autocrlf=true` vs an LF-only executable
+
+- **Needed:** `bin/harness` committed with LF and mode 100755, so Linux CI can
+  run it via the shebang.
+- **Offered:** Git for Windows sets `core.autocrlf=true` system-wide. The index
+  stays LF, but any checkout on this machine writes CRLF to the working tree.
+  A doctor check on the working tree would warn permanently here for a
+  harmless reason.
+- **Implemented:** committed with `git update-index --chmod=+x` (index shows
+  `100755`, `i/lf`). The `harness-lf` check inspects the index blob (what CI
+  receives) and falls back to the working tree only when untracked. No
+  `.gitattributes`: it is outside this repo's editable scope and not needed
+  while the index is LF.
+
+### CI edits go through the protected path
+
+- `.github/**` is in `sandbox.protected`. The Phase 2 step adding
+  `run.py --tiers static` to `.github/workflows/taniko.yml` was made as an
+  explicitly human-approved change and is labelled so in the commit message.
+  Behavioral joins in Phase 3, once verify exists: running it now would make
+  CI red on a known, expected FAIL.
