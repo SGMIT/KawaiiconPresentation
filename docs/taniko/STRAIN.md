@@ -1191,3 +1191,164 @@ and tested it outside the repo.
   `pip install jsonschema`, and no suite doc names a format extra.
 - **Lesson:** a schema keyword is only enforced if the validator's optional
   extras are installed; pin them where the gate runs, in CI and locally.
+
+## Prompt 2a Phase 2 — Worktree-isolated nodes with disjoint write scopes
+
+Session 2026-11-20, branch `taniko/graph-layer-phase`, base `6215ad5`,
+code commit `63fa8ab`. Red `vr_84d2bc330f31`, green `vr_78c14b522d39`
+(both `mode: real`, HEAD `6215ad5`).
+
+### loglint G7 is exact-string intersection; prefix and glob overlap pass — `file-against-taniko`
+
+- **Needed:** G7 auditable from the log: sibling spawns with overlapping
+  write sets must fail the lint.
+- **Offered:** the grammar says "pairwise-disjoint `scope.writes`"; the
+  schema types entries as bare strings with no syntax. `loglint.py:94-100`
+  intersects the entries as string sets. Probe (a phase log with `nb`'s
+  spawn writes edited, `na` = `["docs/a.md"]`, 3 logs):
+  `["docs/a.md"]` → `LOGLINT FAIL … G7: spawned siblings 'na' and 'nb' share write scope ['docs/a.md']`;
+  `["docs/"]` → `LOGLINT PASS (grammar 0.1): 10 records`;
+  `["docs/*.md"]` → `LOGLINT PASS (grammar 0.1): 10 records`.
+- **Implemented:** `validate_plan` decides overlap on the declared syntax
+  (below), so no plan this layer runs can produce such a log. The lint
+  still can't catch one written by anything else.
+- **Delta:** with prefix or glob scopes, G7 "auditable from the log alone"
+  holds only for identical strings. 1 of 3 overlapping logs caught.
+- **Lesson:** a disjointness rule needs a defined entry syntax and an
+  overlap relation in the spec; set intersection over strings is only
+  correct when every entry is an exact path.
+
+### Decision: write-scope syntax and overlap
+
+- **Needed:** a write-scope syntax and an overlap rule (prompt: implementation
+  decision; conservative where undecidable).
+- **Offered:** the schema's `scope.writes` is `array of string`, unique
+  items, no syntax.
+- **Implemented:** `graph/scope.py`. Repo-relative POSIX entries: exact path
+  (`docs/a.md`), directory prefix (`docs/`, trailing slash), glob (`*`, `?`
+  within a segment; `**` as a whole segment spans any depth). Rejected:
+  empty, absolute, `.`/`..`/empty segments, backslashes, `[...]` classes,
+  `**` inside a segment, a glob ending in `/` (10 malformed entries tested).
+  Overlap is exact for exact/exact, exact/prefix, prefix/prefix and
+  exact/glob. For glob/prefix and glob/glob: disjoint only when neither
+  literal prefix (text before the first wildcard) is a prefix of the other,
+  otherwise overlapping, so `docs/*.md` vs `docs/*.txt` is rejected. That
+  pair is disjoint in fact; rejecting it is the conservative choice.
+  Overlap compares case-folded text, since this checkout is on APFS
+  (case-insensitive) and `docs/A.md` and `docs/a.md` name one file.
+  Runtime membership is case-exact, so a write differing only in case
+  counts as out of scope. Both directions fail closed. Tests: 9 overlapping
+  pairs rejected, 6 disjoint accepted, symmetry over all 15, 10 `covers`
+  cases.
+- **Delta / untested:** Unicode normalization (NFC vs NFD names on APFS) is
+  not handled or tested. The literal-prefix rule can reject disjoint glob
+  pairs. Callers must split such scopes or serialize the nodes.
+- **Lesson:** "conservative" has to name a direction for each side: plan
+  time rejects anything it can't prove disjoint, and runtime rejects any
+  write it can't prove is covered.
+
+### Decision: fixture marker name and location
+
+- **Needed:** helpers that refuse any repository without a fixture marker;
+  the real repository never carries one.
+- **Implemented:** `graph/fence.py`. Marker `.taniko-graph-fixture`, a
+  regular file at the **main worktree root**, found through
+  `git rev-parse --path-format=absolute --git-common-dir`, so linked
+  worktrees of a fixture pass and worktrees of a real repo don't. The
+  marker is committed in the fixture, not hidden under `.git/`, so if
+  anyone creates it in a real checkout `git status` shows it as untracked.
+  Fenced: `fixture_git`, `fixture_commit`, `make_fixture_repo` (which also
+  refuses a parent inside this checkout), `StubRunner.check` and
+  `StubRunner.run`, and therefore `run_fanout` with the stub, which runs
+  `check` before resolving the base or creating anything. Asserted against
+  this repository: 5 refusal subtests plus `test_this_repository_carries_no_marker`.
+- **Delta:** the marker is visible but not *gated*: the tamper guard
+  doesn't list it, so an agent could create one. Operator follow-up: add
+  `.taniko-graph-fixture` to `sandbox.protected` in `.claude/harness.json`
+  (I may not edit it).
+- **Lesson:** a fence marker should be visible in review, and the operator
+  should be the only one who can create it.
+
+### Stub mode is not gated at operator level
+
+- **Needed:** "stub mode must be unreachable without operator-level
+  configuration."
+- **Offered:** no operator-owned config surface I can write. `harness.json`
+  is protected and has no graph/runner key.
+- **Implemented:** the stub sets `identity` (logged on every enter, e.g.
+  `runner: stub-runner (deterministic test stand-in; no agent session)`)
+  and refuses non-fixture repos. `run_fanout` has no default runner and
+  requires a non-empty `identity`.
+- **Delta:** the stub is gated by the fixture fence, which isn't yet
+  operator-gated (entry above). `graph/toy.py` (Phase 1) is still a stub
+  path anyone can reach (`python3 -m graph.toy`) that writes into the real
+  `.agent/graph/`. I didn't change it, because that's outside this phase.
+- **Lesson:** I couldn't meet "operator-level" from the agent's side. It
+  needs an operator-owned switch, either a protected marker or a
+  declaration key.
+
+### Red step: full runner output now in the raw tier log — resolves C4's "untested in-harness"
+
+- **Needed:** confirm the `73def13` raw-log fix on a real red.
+- **Offered/Implemented:** red `vr_84d2bc330f31`: `graph FAIL 46 cases run
+  (34 tests, 15 subtests), 0 failed, 18 errored`. Feedback lists 5
+  locations plus "13 more". The raw log
+  `.agent/verify/logs/vr_84d2bc330f31-graph.log` is 288 lines and holds
+  the verbose runner output, with all 18 non-passing cases named by
+  `ERROR:` lines (13 methods, 5 subtests of
+  `test_helpers_refuse_this_repository`).
+- **Delta:** red and green denominators differ (46 vs 99). In red, the 13
+  `FixtureCase` tests errored in `setUp`, before their subtests ran. Two
+  new tests passed in red and so never bit:
+  `test_this_repository_carries_no_marker` (a precondition, true before and
+  after) and `test_fixture_helper_refuses_parent_inside_checkout` (the
+  fixture helper was written as test infrastructure before the red run).
+  Skeleton fence raised `NotImplementedError` rather than no-op, so no
+  helper could touch the real checkout during red.
+  Mutation probes after green (monkeypatched, not committed): `covers`
+  always true → 5 failures in `ScopeViolationTest`; `first_overlap` never
+  → 1 failure + 8 errors in `ScopeOverlapTest`; ignored files dropped from
+  `changed_paths` → 1 failure.
+- **Lesson:** when setUp errors, the red count doesn't show how many cases
+  the suite will have. Compare red and green by test name, not by count.
+
+### Zero-debris check, in-suite and by snapshot
+
+- **Implemented:** `test_fanout.py` `setUpModule`/`tearDownModule` compare
+  `ls .agent/graph/`, `git worktree list --porcelain` and `git branch
+  --list` of this checkout and raise if they changed. The manual
+  before/after snapshot around the green verify had an empty diff (in
+  PROGRESS). `graph/gitcmd.py` strips repo-locating `GIT_*` variables
+  (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, …) so an inherited
+  environment can't redirect a fixture command at the real repo.
+- **Delta:** the snapshot includes two Copilot-app worktrees
+  (`copilot-prewarm-literate-disco`, `stacy-mclean-nzcs-curly-lamp`). They
+  predate this phase and are outside my control. If the app adds or reaps
+  one mid-run, the in-suite check gives a false failure. Untested.
+- **Lesson:** a debris check on a shared checkout also sees other tools'
+  state. It works here only because the window is a few seconds.
+
+### What runtime scope detection does not see
+
+- **Implemented:** changes against the base SHA from `git diff --name-only
+  --no-renames <base>` (committed, staged, unstaged, deletions, both sides
+  of renames) plus `git ls-files --others` without `--exclude-standard`, so
+  ignored files count. Tested: untracked, modified, deleted, ignored, and
+  nested-new-directory violations; the sibling stays green.
+- **Delta / untested:** writes outside the worktree (absolute paths, `..`,
+  symlinks out of the worktree, the main checkout) are not detected. That
+  needs process sandboxing, not git. Not detected either: mode-only
+  changes when `core.fileMode=false`, and writes into `.git` of the
+  worktree. Nodes run sequentially, so concurrency is untested. Worktrees
+  aren't reaped (there's no `clean` yet). Fixture worktrees disappear with
+  the temp dir, but a real run's would stay.
+- **Lesson:** "detected from the worktree's actual changes" covers only
+  what git can see. A runner that escapes the worktree needs an OS-level
+  sandbox.
+
+### Smaller observations
+
+- The tamper guard denied a read-only `sed -n 80,200p bin/tier-graph`, the
+  same false positive as the P2a-0 entry. `view` worked.
+- `NodeSpec` has no input artifacts yet, so enters carry no
+  `inputs_digest`. The grammar doesn't require one; deferred.
