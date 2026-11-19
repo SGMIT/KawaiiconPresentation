@@ -939,3 +939,108 @@ implies a spec change are marked `file-against-taniko`.
   settings.
 - **Doctor python3 FAIL:** still fails on `/usr/bin/python3` 3.9.6, as noted
   in C0. Not new.
+
+## Prompt 2a Phase 0 — Graph foundations setup
+
+### Phase 0 conformance failed on interpreter, not declaration — `file-against-taniko`
+
+- **Needed:** `python3 ../taniko/conformance/run.py --repo . --tiers static`
+  to judge the declaration.
+- **Offered:** `decl-present-valid` imports `jsonschema`
+  (`conformance/checks.py:105`) and reports a missing import as a FAIL:
+  5 pass / 1 fail / 1 skip, NONCONFORMANT. `python3` on PATH was
+  `/usr/bin/python3` 3.9.6, below the declared `>=3.10`, with no jsonschema;
+  Homebrew 3.12/3.13/3.14 also lacked it.
+- **Implemented:** venv at `~/.venvs/taniko` (Python 3.12.7, jsonschema
+  4.26.0), put first on PATH per command. Result: 6 pass / 0 fail / 1 skip,
+  CONFORMANT. No repo files changed.
+- **Delta:** a missing suite dependency is a suite error (exit 2), not a
+  conformance failure attributed to the adopter. Same class as the Phase 0
+  Windows `python3` entry.
+- **Lesson:** the gate environment is part of Phase 0; record which
+  interpreter ran each gate.
+
+### `PROGRESS.md` was assumed by the prompt but never created — `file-against-taniko`
+
+- **Needed:** Prompt 2a's re-issue rule reads `docs/taniko/PROGRESS.md` to
+  pick the phase.
+- **Offered:** Prompt 1 never produced it; the rules file permitted only
+  `STRAIN.md` appends.
+- **Implemented:** reconstructed Prompt 1 entries from commits `df68d7c`..
+  `b4127a0`; the operator added `PROGRESS.md` to the rules file's append
+  scope. The file is an append-only log. The first draft was a mutable
+  status table, which contradicted append-only; it was replaced before
+  its first commit.
+- **Delta:** the progress file is a cross-prompt contract with no producer
+  in Prompt 1. Name it as a Prompt 1 deliverable.
+- **Lesson:** a rule that gates a session must have a phase that creates
+  its input.
+
+### No writable home for graph code — `file-against-taniko`
+
+- **Needed:** a location for the appender, worktree runner, and their tests.
+- **Offered:** `sandbox.writable` covered deck content and `docs/**` only;
+  `bin/**` (the verifier) is protected. CONTRACTS §1 says the engine should
+  be a pinned dependency, not vendored code.
+- **Implemented:** the operator added `graph/**` to `sandbox.writable` and
+  to the rules file. Graph code lives in-repo; run evidence goes under
+  `.agent/graph/<run-id>/` (gitignored, per EVIDENCE-LAYOUT).
+- **Delta:** building the graph layer in the adopting repo contradicts the
+  "engine is a pinned dependency" placement rule; the suite ships no graph
+  engine at v0.4.0 to pin.
+- **Lesson:** decide placement before Phase 1, in a protected-file change
+  the operator makes.
+
+### Graph tests need a tier adapter; plain `unittest` does not satisfy the contract
+
+- **Needed:** graph tests counted by `verify`, so they are evidence.
+- **Offered:** `bin/harness` treats a tier that exits without writing a
+  `$KC_TIER_RESULT` record as error, so `python3 -m unittest discover`
+  cannot be a tier directly.
+- **Implemented:** the agent drafted `bin/tier-graph` in the session folder;
+  the operator installed it (byte-identical, `diff` clean) and declared tier
+  `graph` (`cost_class: unit`). Smoke-tested outside the repo on throwaway
+  fixtures: missing `graph/tests` → error/2; 0 tests → error/2; import
+  error → error/2; 1 failing of 2 → fail/1; 1 passing → pass/0.
+- **Delta:** the CI comment at `.github/workflows/taniko.yml:41` keeps
+  boundary-machinery tests (the guard's) out of verify. The graph tier is a
+  deliberate exception: these tests gate agent-produced work. Untested: the
+  tier inside a full `verify` run (deferred; see next entry).
+- **Lesson:** a new tier ships with its adapter and a refusal for zero
+  executed tests, or it passes vacuously.
+
+### Full verify deferred to protect the attempt budget
+
+- **Needed:** a full `verify` after declaring the graph tier.
+- **Offered:** the ledger for `b4127a0` already held 2 attempts (earlier
+  verifies on changed trees); a third would exhaust it before the setup was
+  committed. Separately, the tier reports error until `graph/tests` exists.
+- **Implemented:** checked with static conformance only; full verify left
+  to Phase 1, on the new commit's fresh ledger.
+- **Delta:** same as C3: operator harness edits spend the author's budget.
+- **Lesson:** commit harness changes before verifying, then verify once.
+
+### Tamper guard false positives on non-writing shell commands — `file-against-taniko`
+
+- **Needed:** read and execute protected files, and write prose that names
+  them, without writing the protected files.
+- **Offered:** the Copilot preToolUse guard denied all four:
+  - `grep -n -i "attempt\|budget" bin/harness`: `refusing shell segment
+    'budget" bin/harness' targets bin/harness`. The `\|` inside quotes was
+    split as a pipe.
+  - `KC_TIER_RESULT=/tmp/kc_r.json python3 bin/tier-graph`: denied as
+    targeting `bin/tier-graph`.
+  - `python3 bin/tier-graph`: denied likewise. `python3 bin/harness verify`
+    is allowed, so executing `bin/**` is allowlisted per command, not judged
+    by read/write intent.
+  - `cat >> docs/taniko/STRAIN.md <<'EOF' … EOF`: `refusing shell segment
+    'AGENTS.md' targets AGENTS.md`. A file name inside heredoc text was
+    treated as a write target.
+- **Implemented:** used the grep tool for reads and the edit tool for this
+  append; did not run the tier directly. `verify` still runs it as a child
+  process, which the guard does not see.
+- **Delta:** the segment splitter ignores shell quoting and heredoc bodies,
+  and executing a protected script counts as writing it. Fails closed, as
+  designed, but blocks legitimate inspection.
+- **Lesson:** inspect protected files with non-shell read tools, write docs
+  with the edit tool, and exercise tiers only through `verify`.
