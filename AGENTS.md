@@ -6,8 +6,24 @@ Never edit `.claude/`, `bin/`, `.github/`, `AGENTS.md`, `CLAUDE.md`, `TANIKO_VER
 ## Scope
 
 - You may edit the deck content only: `index.html`, `css/**`, `assets/**`, `notes.md`, `sources.md`.
-- `README.md` and `docs/**` are read-only.
+- You may also append to `docs/taniko/STRAIN.md` (see Recording strain).
+- `README.md` is read-only.
 - The harness declaration is `.claude/harness.json`; session state lives in `.agent/` (gitignored, never commit it).
+
+## Recording strain
+
+- When the harness, the Tāniko suite, or a tool doesn't behave as expected,
+  record it in `docs/taniko/STRAIN.md` before you report the task done.
+- Append only. Add a new `## Correction Cn — <title>` or `### <finding>` entry
+  at the end. Never edit, reorder, or delete existing entries; to correct one,
+  add a new entry that names the one it supersedes.
+- Each finding uses **Needed / Offered / Implemented / Delta**, cites evidence
+  (commit, test counts red → green, exact deny output), and ends with the
+  lesson learned.
+- Record what you observed, not what you intended. Untested claims are listed
+  as untested.
+- `STRAIN.md` changes are reviewed in each commit's diff; append-only is not
+  enforced by the guard.
 
 ## Verification
 

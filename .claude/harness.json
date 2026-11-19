@@ -19,8 +19,8 @@
     }
   ],
   "sandbox": {
-    "writable": ["index.html", "css/**", "assets/**", "notes.md", "sources.md"],
-    "read_only": ["README.md", "docs/**"],
+    "writable": ["index.html", "css/**", "assets/**", "notes.md", "sources.md", "docs/**"],
+    "read_only": ["README.md"],
     "protected": [".claude/**", "bin/**", ".github/**", ".cursor/**", "AGENTS.md", "CLAUDE.md", "TANIKO_VERSION", ".gitignore"]
   },
   "state": { "dir": ".agent" },
