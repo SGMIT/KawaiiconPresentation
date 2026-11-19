@@ -826,3 +826,116 @@ implies a spec change are marked `file-against-taniko`.
 - Long free-text arguments (subagent prompts, memory citations) are walked as
   strings. A string that is exactly a guarded path makes an unknown tool deny
   — a false positive, which fails closed.
+
+## Correction C3 — Live proof of the Copilot adapter
+
+### The hook loads and denies in a GitHub Copilot app session
+
+- **Needed:** evidence that `.github/hooks/tamper-guard.json` fires in a real
+  Copilot session, not only in the guard's subprocess tests (C2).
+- **Offered:** C2 proved the guard against recorded payloads. Nothing had
+  driven the agent CLI itself.
+- **Implemented:** probes run from a Copilot app session (in-place checkout,
+  branch `taniko/harness-loop`, HEAD `3d69f6f`, macOS `/usr/bin/python3`
+  3.9.6) on 2026-11-19. Each probe was chosen to change nothing if the hook
+  failed to load: the edits used an `old_str` that does not exist, and the
+  shell probe only reads.
+
+  | Probe | Tool | Result |
+  |---|---|---|
+  | edit `bin/harness` | `edit` | Denied: `refusing mutation bin/harness (matches sandbox glob 'bin/**')` |
+  | `sed -n 1p bin/harness` | `bash` | Denied: `refusing shell segment 'sed -n 1p bin/harness' targets bin/harness` |
+  | edit `.github/hooks/tamper-guard.json` | `edit` | Denied: `matches sandbox glob '.github/**'` |
+  | `ls bin/harness` (control) | `bash` | Allowed |
+  | edit `notes.md` (control) | `edit` | Allowed through the hook; the tool then reported no change |
+
+  Every deny came back as `Denied by preToolUse hook: tamper_guard: ...`, so
+  the denials came from the repository hook, not a Claude deny rule.
+  `git status` was clean afterwards, and `python3 bin/harness verify` gave
+  VERDICT: PASS.
+- **Delta / untested:**
+  - `apply_patch` was not probed; this app session has no such tool.
+  - Redirect writes (`cat notes.md > bin/harness`) were not probed live; if
+    the hook had not loaded, they would have overwritten the file. They
+    remain covered only by the C1/C2 tests.
+  - The fail-open timeout and the Claude `PreToolUse` double-run were not
+    exercised.
+- **Lesson:** design live tamper probes so that a missing hook leaves nothing
+  changed. Then a pass shows the hook works, and a failure costs nothing.
+
+### `docs/**` was read-only, so the agent could not record strain
+
+- **Needed:** agents append what they run into, and the lessons learned, to
+  this file.
+- **Offered:** Phase 1 declared `docs/**` in `sandbox.read_only`, and
+  `AGENTS.md` repeated it. The guard denies every path that matches
+  `protected` or `read_only`, so this file could not be written. The C3
+  results had to be reported in chat instead.
+- **Implemented (operator change, commit `708d371`):**
+  - `.claude/harness.json`: `docs/**` moved from `read_only` to `writable`.
+    `read_only` is now `["README.md"]`.
+  - `.claude/settings.json`: dropped the `docs/**` deny entries and added
+    allow entries for `docs/taniko/STRAIN.md`.
+  - `AGENTS.md`: Scope now allows appending to `STRAIN.md`, and a new
+    *Recording strain* section sets the rules: append only, Needed /
+    Offered / Implemented / Delta, cite evidence, record lessons.
+  - Doctor `tamper-rules-aligned` PASS. A no-op edit probe on this file
+    passed the hook.
+  - Getting there took three tries. The first moved `docs/**` into
+    `protected`, which locked the file more tightly, and left a trailing
+    comma that made `.claude/settings.json` invalid JSON. The second emptied
+    the `AGENTS.md` Scope section. Doctor caught the JSON error, and the
+    no-op probe and a re-read caught the other two.
+- **Delta:**
+  - The guard ignores `sandbox.writable` and cannot carve an exception out of
+    a protected glob. A single writable file therefore means unlocking its
+    whole glob: the agent can now write any file under `docs/`, not only
+    `STRAIN.md`.
+  - Nothing enforces append-only. Review each commit's diff of this file.
+  - The agent being verified now writes part of its own record, so its
+    self-reports need checking against evidence.
+- **Lesson:** decide early which records the agent must write and declare
+  them writable. A blanket read-only glob silently blocks the feedback loop.
+
+### Attempt budget exhaustion blocked this entry
+
+- **Needed:** the agent writes this entry once C3 completes.
+- **Offered:** the ledger counts one attempt per distinct working-tree state
+  per HEAD; re-verifying an unchanged tree reuses its attempt. The ledger for
+  `3d69f6f` held three:
+  1. a pass at 01:13Z, from before the C3 session;
+  2. a fail at 01:13Z on a deliberately broken `index.html` (text after
+     `</html>`). This looks like the conformance suite's destructive probe,
+     which spends an attempt on every HEAD in the ledger (`46ddadb`,
+     `f65eba6`, `3d69f6f`);
+  3. a pass at 02:15Z: the agent re-verified after the operator's
+     uncommitted harness edits, which changed the tree.
+
+  The agent's first C3 verify (01:56Z) reused attempt 1. The append was then
+  denied: `tamper_guard: BUDGET EXHAUSTED (3 of 3 attempts used): stop and
+  escalate. Human reset: delete .agent/verify/attempts/<HEAD>.json`.
+- **Implemented:** the agent did not reset its own budget. It escalated, and
+  the operator committed the harness change (`708d371`), which started a
+  fresh ledger.
+- **Delta:**
+  - The soft halt checks no path. It denied every write tool, including
+    `create` on a draft in the session folder outside the repository.
+  - Harness edits spend the deck author's budget, because the ledger counts
+    any tree change.
+  - The suite's destructive probe leaves one fewer attempt for the author
+    on every HEAD.
+  - The halt blocks strain recording at the moment the agent hits the
+    limit, so the record of that strain cannot be written then.
+- **Lesson:** after a harness-only change, check it with doctor rather than
+  a full verify, or commit it first. Consider exempting `STRAIN.md` appends
+  from the halt, and keeping the suite's probe out of the author's ledger.
+
+### Smaller observations
+
+- **Reader allowlist false positive:** `python3 -m json.tool
+  .claude/settings.json >/dev/null`, a read-only JSON check, was denied
+  because `python3 -m` is not on the reader list. This fails closed as
+  designed. `python3 bin/harness doctor` is the allowed way to validate
+  settings.
+- **Doctor python3 FAIL:** still fails on `/usr/bin/python3` 3.9.6, as noted
+  in C0. Not new.
