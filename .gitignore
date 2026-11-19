@@ -13,3 +13,5 @@ node_modules/
 
 # Tāniko harness session state (progress, caches, checkpoints)
 .agent/
+
+__pycache__/

@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install suite dependencies
-        run: python3 -m pip install jsonschema
+        run: python3 -m pip install 'jsonschema[format-nongpl]'
 
       # The suite judges this repo, so it is cloned outside the checkout
       # (sibling of repo/, reached as ../taniko) at exactly the pinned tag.
