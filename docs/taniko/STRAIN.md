@@ -1142,3 +1142,52 @@ Code commit `518fe76`. Red `vr_047ac4d82fa5` (graph FAIL, 18 run) → green
   Linux, so this should carry, but is unproven); Windows (`fcntl` absent).
 - **Lesson:** "enforced by the appender" is bounded by what the tests reach;
   the threading claim is design, not evidence.
+
+## Correction C4 — operator fixes after Prompt 2a Phase 1
+
+Resolves three Prompt 2a Phase 1 entries (above), which stay as written.
+Operator-made (protected files); the agent drafted the `tier-graph` patch
+and tested it outside the repo.
+
+### tier-graph counts subtests as cases — resolves "tier-graph reports more failures than tests run" and "Red evidence cites only 20 of 25 failures"
+
+- **Needed:** numerator and denominator in one unit; every failing case
+  named in an artifact.
+- **Offered:** `bin/tier-graph` counted methods run but subtest failures.
+- **Implemented:** commit `73def13`. A `TextTestResult` subclass counts each
+  subtest as a case in place of its parent method; on fail the full verbose
+  runner output goes to stdout (the harness's raw tier log), with a note when
+  feedback locations are cut at 20. Smoke test outside the repo, fixture of
+  1 passing test, 1 failing test, 1 test with 3 subtests (2 failing):
+  `FAIL - 5 cases run (3 tests, 3 subtests), 3 failed`, exit 1, all 3 named
+  in the output. In-harness: `vr_c0f7b88716d0` (`mode: real`,
+  2026-11-19T18:50:43.395Z, HEAD `0d41757`), graph `PASS - 26 cases run
+  (18 tests, 10 subtests), 0 failed, 0 errored, 0 skipped`.
+- **Delta:** the denominator unit changed: Phase 1's "18 run" and this "26
+  cases" count the same 18 tests. Compare later counts in cases. The raw-log
+  fix is **untested in-harness**: no red verify has run since `73def13`.
+  The five uncited Phase 1 red failures stay uncited; this doesn't change
+  past evidence.
+- **Lesson:** fix a tier's counting unit before its numbers become
+  history, and note the unit change where the counts are recorded.
+
+### `__pycache__/` ignored — resolves "`__pycache__/` not gitignored"
+
+- **Implemented:** commit `0d41757` adds `__pycache__/` to `.gitignore`.
+  `git status --short --ignored` now lists `graph/__pycache__/` and
+  `graph/tests/__pycache__/` as ignored (`!!`); the tree is clean.
+- **Delta:** none.
+
+### Date-time format enforced in CI and the local gate venv — partially resolves "`format: date-time` is silently unenforced"
+
+- **Implemented:** commit `0d41757`: CI installs
+  `'jsonschema[format-nongpl]'` (chosen over `format`, which pulls a
+  GPL-licensed package). Local `~/.venvs/taniko` now has
+  `rfc3339-validator 0.1.4`; `FormatChecker` there rejects `"not-a-date"`
+  ("'not-a-date' is not a 'date-time'").
+- **Delta:** the CI change is **untested**: not pushed, no CI run yet. The
+  suite-side finding stands (`file-against-taniko`): the suite's only install
+  line, its own CI (`../taniko/.github/workflows/gates.yml:18`), is plain
+  `pip install jsonschema`, and no suite doc names a format extra.
+- **Lesson:** a schema keyword is only enforced if the validator's optional
+  extras are installed; pin them where the gate runs, in CI and locally.
