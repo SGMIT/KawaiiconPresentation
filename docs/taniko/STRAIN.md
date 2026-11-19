@@ -1044,3 +1044,101 @@ implies a spec change are marked `file-against-taniko`.
   designed, but blocks legitimate inspection.
 - **Lesson:** inspect protected files with non-shell read tools, write docs
   with the edit tool, and exercise tiers only through `verify`.
+
+## Prompt 2a Phase 1 — Routing log appender
+
+Code commit `518fe76`. Red `vr_047ac4d82fa5` (graph FAIL, 18 run) → green
+`vr_3c60319d8ee6` (graph PASS, 18 run, 0 failed). Toy log: loglint PASS,
+12 records; schema 12 of 12 valid.
+
+### tier-graph reports more failures than tests run
+
+- **Needed:** a red verify whose counts are a coherent denominator.
+- **Offered:** `graph FAIL — 18 run, 25 failed`; summary "25 of 18 graph
+  tests did not pass". `unittest` counts `testsRun` per method but one
+  failure per failing `subTest` (two tests carry 3 + 7 subtests).
+- **Implemented:** nothing; `bin/tier-graph` is protected. Counts read as
+  "18 methods run; 25 failing cases".
+- **Delta:** numerator and denominator count different units.
+- **Lesson:** a tier that uses `subTest` must count subtests in both
+  numbers, or neither. Operator fix in `bin/tier-graph`, not a suite issue.
+
+### Red evidence cites only 20 of 25 failures
+
+- **Needed:** the red document to cite every new test that bit.
+- **Offered:** `feedback.locations` is capped at 20; the raw tier log
+  (`verify/logs/vr_047ac4d82fa5-graph.log`) is the tier's 8-line stdout,
+  not the unittest output. 5 failing cases (among them, by elimination,
+  `test_reopen_rejects_seq_gap`, `test_second_writer_rejected`,
+  `test_reopen_rejects_other_run_id`, `test_reopen_continues_seq_and_bracket_state`,
+  `test_toy_log_passes_loglint`) are not named in any artifact.
+- **Implemented:** listed the cited cases in PROGRESS; the uncited five are
+  claimed failing by reasoning about the skeleton, not by artifact —
+  **untested** as evidence.
+- **Delta:** red→green for those five rests on narrative.
+- **Lesson:** the tier should keep the full runner output in its raw log.
+  Operator fix in `bin/tier-graph`.
+
+### loglint says "evidence resolves" after checking zero refs — `file-against-taniko`
+
+- **Needed:** a denominator on every lint claim (validate-run rule 5).
+- **Offered:** v0.4.0 `loglint.py` without `--evidence-dir` prints
+  `LOGLINT PASS (grammar 0.1): 12 records, brackets balanced, evidence resolves`;
+  G8 is skipped entirely and the toy log has 0 `verify_ref`s. The
+  taniko-validate-run skill names this exact message as a past defect.
+- **Implemented:** PROGRESS states G8 checked 0 of 0.
+- **Delta:** the pinned lint still prints the vacuous claim.
+- **Lesson:** print "G8 skipped (no --evidence-dir)" or "N of M refs
+  resolved"; never the bare phrase.
+
+### loglint does not schema-validate records — `file-against-taniko`
+
+- **Needed:** "a log is conformant only when every record passes the schema
+  AND the whole log passes the lint" (routing-log-grammar.md).
+- **Offered:** `loglint.py` checks grammar only (schema use is limited to
+  G8 verify-result docs). No suite command validates a routing log's
+  records against `routing-record.schema.json`.
+- **Implemented:** the appender validates each record before writing; the
+  12-of-12 count was produced with the appender's validator.
+- **Delta:** the half of conformance the grammar calls mandatory has no
+  executable form in the suite.
+- **Lesson:** loglint (or a sibling) should run the record schema per line.
+
+### `format: date-time` is silently unenforced — `file-against-taniko`
+
+- **Needed:** `at` to be a real RFC 3339 timestamp.
+- **Offered:** jsonschema 4.26.0 with `FormatChecker()` accepts
+  `"not-a-date"` for `format: date-time` (returns 0 errors) because
+  `rfc3339-validator` is not installed; CI installs only `jsonschema`.
+- **Implemented:** the appender owns `at`: tz-aware clock required (naive
+  clock rejected as G2, tested), formatted as UTC `…%fZ`.
+- **Delta:** any consumer relying on the schema for `at` validity gets
+  nothing; the suite's own install line (`pip install jsonschema`) doesn't
+  pull the format extra.
+- **Lesson:** install `jsonschema[format]`, or don't rely on `format`.
+
+### `__pycache__/` not gitignored
+
+- **Needed:** a clean tree after running graph tests.
+- **Offered:** `graph/__pycache__/` and `graph/tests/__pycache__/` appear
+  untracked; `.gitignore` is protected.
+- **Implemented:** staged source files by name; left the caches untracked.
+- **Delta:** `git status` is never clean after verify; `git add graph` would
+  commit bytecode.
+- **Lesson:** operator should add `__pycache__/` to `.gitignore`.
+
+### Scope decisions and what stays untested
+
+- **Needed:** G1–G3 at append time, schema conformance, closed brackets on
+  failure.
+- **Offered:** the grammar also has G4–G9; `fail` outside a bracket is not
+  forbidden by the grammar.
+- **Implemented:** G1–G3 plus G4's "nothing after the root exits". `fail` is
+  accepted only via the schema; `fail_and_exit()` requires an open bracket.
+  G5–G7 and G9-beyond-schema are left to loglint.
+- **Delta / untested:** concurrent appends from multiple threads (an
+  `RLock` is held, no test); cross-process single-writer (tested only as two
+  opens in one process — `flock` is per open file description on macOS and
+  Linux, so this should carry, but is unproven); Windows (`fcntl` absent).
+- **Lesson:** "enforced by the appender" is bounded by what the tests reach;
+  the threading claim is design, not evidence.

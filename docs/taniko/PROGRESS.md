@@ -65,3 +65,67 @@ creates `graph/tests` (zero executed tests is not evidence). Do not push
 until Phase 1 is green — CI's behavioral conformance runs `verify`.
 
 Next: Prompt 2a Phase 1 (routing log appender), in a new session.
+
+## P2a-1 — Prompt 2a Phase 1 (routing log appender) — complete
+
+Session 2026-11-20, branch `taniko/graph-layer-phase`. Code commit `518fe76`
+(base `db15088`); this entry and the STRAIN section land in the next commit.
+
+Phase 0: `TANIKO_VERSION` `v0.4.0` = `../taniko` tag `v0.4.0`; static
+conformance 6 pass / 0 fail / 0 warn / 1 skip, CONFORMANT; tree clean.
+
+Delivered (`graph/**`):
+
+- `graph/routing_log.py` — `RoutingLog`, the single writer (exclusive
+  `flock`) for one run's `routing.jsonl`. Assigns `seq` and `at`; validates
+  every record against the pinned `routing-record` schema (`$id` checked =
+  0.4.0) before writing; rejects at append time: caller-supplied
+  `seq`/`at`/`run_id`/`schema_version`, `at` going backwards or from a naive
+  clock (G2), re-enter while open, exit without enter, double close (G3),
+  any append after the root exits (G4). Reopen replays and refuses a seq gap
+  (G1), a foreign `run_id`, or any invalid line. A rejected append writes
+  nothing and consumes no seq. `node()` / `fail_and_exit()` close brackets on
+  terminal failure (`fail`, then `exit`).
+- `graph/toy.py` — stub-runner toy log (2-way fan-out, one branch fails,
+  run escalates). No real agent sessions.
+- `graph/tests/test_routing_log.py` — 18 tests (17 appender, 1 toy-log →
+  pinned `loglint.py`).
+
+Red → green (verify documents, `mode: real`, HEAD `db15088` ledger):
+
+```
+attempt 1  vr_047ac4d82fa5  2026-11-19T18:37:20.658Z  (skeleton appender, no enforcement)
+  static     PASS     104ms  well-formed; 1 local reference(s) resolve, 17 remote not fetched; 1 stylesheet(s) scanned
+  content    PASS      80ms  22 talk slides in order; 22 speaker entries matched; 5/5 Resources links in sources.md
+  graph      FAIL     146ms  18 run, 25 failed, 0 errored, 0 skipped
+  cited (first 20 of 25 locations): test_rejects_double_close, test_rejects_reenter_while_open,
+  test_rejects_exit_without_enter, test_rejects_caller_supplied_seq, test_rejects_time_going_backwards,
+  test_rejects_schema_invalid_records (7 subtests), test_append_after_root_exit_rejected, ...
+VERDICT: FAIL
+
+attempt 2  vr_3c60319d8ee6  2026-11-19T18:39:17.409Z  (tree = commit 518fe76)
+verify: profile full [static, content, graph]
+  static     PASS     113ms  well-formed; 1 local reference(s) resolve, 17 remote not fetched; 1 stylesheet(s) scanned
+  content    PASS      83ms  22 talk slides in order; 22 speaker entries matched; 5/5 Resources links in sources.md
+  graph      PASS     256ms  18 run, 0 failed, 0 errored, 0 skipped
+attempt 2 (max 3)
+VERDICT: PASS
+```
+
+Graph-tier denominator: 0 → 18 executed tests (tier previously ERROR).
+
+Toy log (`python3 -m graph.toy --run-id toy-p2a1`, HEAD `db15088`):
+
+```
+.agent/graph/toy-p2a1/routing.jsonl
+python3 ../taniko/conformance/loglint.py .agent/graph/toy-p2a1/routing.jsonl
+LOGLINT PASS (grammar 0.1): 12 records, brackets balanced, evidence resolves
+schema (appender validator, pinned routing-record 0.4.0): 12 of 12 records valid
+```
+
+loglint ran without `--evidence-dir`; the toy log carries 0 `verify_ref`s, so
+G8 checked 0 of 0 refs ("evidence resolves" is vacuous here — see STRAIN).
+
+Close-out verify on the docs commit: reported in that commit's message.
+
+Next: Prompt 2a Phase 2, in a new session, after human greenlight.
