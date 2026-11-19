@@ -4,6 +4,11 @@
 Exit 0 pass, 1 fail, 2 error, and write {verdict, detail, feedback} to
 $KC_TIER_RESULT. Zero executed tests is an error, never a vacuous pass.
 Import/collection errors are errors, not test failures.
+
+Counts are in cases: a test method is one case, unless it uses subTest, in
+which case each subtest is one case. Failures use the same unit, so the
+numerator never exceeds the denominator. The full runner output goes to
+stdout, which the harness keeps as the tier's raw log.
 """
 import io
 import json
@@ -15,6 +20,24 @@ from pathlib import Path
 ROOT = Path.cwd()
 TESTS = ROOT / "graph" / "tests"
 EXIT = {"pass": 0, "fail": 1, "error": 2}
+
+
+class CaseCountingResult(unittest.TextTestResult):
+    """Counts subtests as cases, replacing their parent method in the total."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parents_with_subtests = set()
+        self.subtests_run = 0
+
+    def addSubTest(self, test, subtest, err):
+        self.parents_with_subtests.add(test.id())
+        self.subtests_run += 1
+        super().addSubTest(test, subtest, err)
+
+    @property
+    def cases_run(self):
+        return self.testsRun - len(self.parents_with_subtests) + self.subtests_run
 
 
 def finish(verdict, detail, summary=None, details=None, locations=None):
@@ -32,6 +55,8 @@ def finish(verdict, detail, summary=None, details=None, locations=None):
     print(f"TIER graph: {verdict.upper()} - {detail}")
     if verdict != "pass":
         print(record["feedback"]["summary"])
+        if locations and len(locations) > 20:
+            print(f"(feedback lists 20 of {len(locations)} locations; full runner output follows)")
     return EXIT[verdict]
 
 
@@ -62,19 +87,22 @@ def main():
                       "graph tests could not be collected; fix the import before judging",
                       "\n".join(loader.errors))
     stream = io.StringIO()
-    result = unittest.TextTestRunner(stream=stream, verbosity=1).run(suite)
-    ran, skipped = result.testsRun, len(result.skipped)
+    result = unittest.TextTestRunner(stream=stream, verbosity=2, resultclass=CaseCountingResult).run(suite)
+    ran, skipped = result.cases_run, len(result.skipped)
     failed, errored = len(result.failures), len(result.errors)
-    counts = f"{ran} run, {failed} failed, {errored} errored, {skipped} skipped"
+    counts = (f"{ran} cases run ({result.testsRun} tests, {result.subtests_run} subtests), "
+              f"{failed} failed, {errored} errored, {skipped} skipped")
     if ran - skipped == 0:
         return finish("error", f"0 tests executed ({counts})",
                       "no graph test executed; zero executed tests is not evidence")
     bad = result.failures + result.errors
     if bad:
-        return finish("fail", counts,
-                      f"{failed + errored} of {ran} graph tests did not pass: "
+        code = finish("fail", counts,
+                      f"{failed + errored} of {ran} graph cases did not pass: "
                       + ", ".join(t.id() for t, _ in bad[:5]),
                       stream.getvalue(), [location(t, tb) for t, tb in bad])
+        print(stream.getvalue())
+        return code
     return finish("pass", counts)
 
 
