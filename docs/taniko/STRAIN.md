@@ -721,3 +721,108 @@ implies a spec change are marked `file-against-taniko`.
   repo root.
 - An unknown tool that writes but never names a path in its payload is still
   allowed.
+
+## Correction C2 — Copilot adapter; Cursor support dropped
+
+### Scope decision: Cursor is no longer a supported tool
+
+- **Needed:** guard the tools the operator actually uses. The operator is
+  now on macOS with GitHub Copilot (and Claude Code if installed); Cursor is
+  no longer in use.
+- **Offered:** the correction prompt asked for a cross-platform Cursor
+  launcher (POSIX `sh` beside the `.ps1`) and a doctor WARN for a missing
+  launcher interpreter.
+- **Implemented (operator decision, deviates from the prompt):** Cursor
+  support is removed rather than made cross-platform.
+  - Removed: `.cursor/hooks.json`, `.claude/hooks/run_guard.ps1`, and the
+    `.cursor/rules/*.mdc` skill copies.
+  - Kept: `.cursor/**` in `sandbox.protected`, in the Claude deny list, and in
+    the guard's `ALWAYS_DENY`. A Cursor config can only reappear through a
+    reviewed path.
+  - Doctor no longer checks a Cursor adapter. The interpreter WARN from the
+    prompt now applies to the Copilot adapter.
+  - Re-running the Tāniko skills installer will recreate `.cursor/rules/`;
+    delete it again or install without the Cursor target.
+- **Delta:** opening this repo in Cursor now gets no hook enforcement. The C2
+  exit criterion "Cursor launcher runs on macOS" is replaced by "Cursor
+  removed, recorded here".
+
+### Copilot adapter
+
+- **Source:** GitHub Copilot hooks reference,
+  https://docs.github.com/en/copilot/reference/hooks-reference (read
+  2026-11-19).
+  - Repository hook files: `.github/hooks/*.json`, format
+    `{"version": 1, "hooks": {"preToolUse": [{"type": "command", "bash": ...}]}}`.
+  - camelCase `preToolUse` payload: `{sessionId, timestamp, cwd, toolName,
+    toolArgs}`, where `toolArgs` is typed `unknown`.
+  - PascalCase `PreToolUse` payload: `{hook_event_name, session_id, cwd,
+    tool_name, tool_input}` with Claude tool names (`apply_patch` → `Edit`,
+    `bash` → `Bash`).
+  - Decision: top-level `permissionDecision` (`allow`/`deny`/`ask`) plus
+    `permissionDecisionReason`, required on deny.
+  - Command hooks fail closed on a crash or any non-zero exit, including 2.
+    **Timeouts fail open.**
+- **Needed:** Copilot sessions on this repo run the same guard, fail-closed.
+- **Offered:** Phase 4 had no Copilot adapter. The guard read only
+  `tool_input` objects, so every camelCase Copilot call (including
+  `apply_patch` raw text) was allowed. Deny output had no top-level
+  `permissionDecision`.
+- **Implemented:**
+  - `.github/hooks/tamper-guard.json`: one `preToolUse` command entry,
+    `python3 .claude/hooks/tamper_guard.py`, `cwd` `.`, `timeoutSec` 30, no
+    matcher (every tool). Covered by `.github/**` in `sandbox.protected`, and
+    `.github/hooks/**` is added to the guard's `ALWAYS_DENY`.
+  - Guard:
+    - reads `toolArgs` / `tool_input` as an object, JSON text, or raw text;
+    - adds `rg` to the read tools;
+    - deny output adds top-level `permissionDecision: "deny"` plus a reason,
+      and writes the reason to stderr for Claude's exit-2 path.
+  - Allow output deliberately never sets `permissionDecision`. `"allow"`
+    would skip Copilot's normal permission prompt for every call. A test pins
+    this.
+  - Doctor `tamper-rules-aligned`: FAIL when no `.github/hooks/*.json`
+    `preToolUse` entry runs the guard, and WARN when that entry's interpreter
+    is not on PATH, since fail-closed would then deny every tool call.
+  - Tests: 51 cases. They add Copilot camelCase payloads (object, JSON-string
+    and raw-string `toolArgs`; `create`, `edit`, `str_replace_editor`,
+    `apply_patch`, `bash`, `powershell`), PascalCase `Edit` with a raw patch,
+    the deny/allow output contract, and the adapter's own `bash` command run
+    as Copilot would run it.
+    - Red against `f65eba6`'s guard: 12 failures out of 51.
+    - Green: 51/51 on Python 3.12 and on macOS `/usr/bin/python3` 3.9.6
+      (the interpreter the app's hook PATH resolves).
+- **Delta:**
+  - Bash-only adapter. Copilot on Windows would run no hook. A `powershell`
+    entry was left out because the Cursor experience showed stdin forwarding
+    under PowerShell can fail closed on every call.
+  - Copilot also reads `.claude/settings.json` hooks (PascalCase, matcher
+    `Edit|Write|Bash`), so those tools run the guard twice. The result is the
+    same and harmless.
+  - Repository hooks need workspace trust. A user-level
+    `~/.copilot/settings.json` with `disableAllHooks` is outside the repo and
+    outside the boundary.
+
+### Which layers enforce on this machine (supersedes the Phase 4 entry)
+
+- **Host:** macOS. No OS sandbox is configured for this repo. Isolation is
+  the agent CLI hook layer only.
+- **GitHub Copilot (CLI and app sessions):** the `.github/hooks/tamper-guard.json`
+  `preToolUse` hook runs the guard for every tool when repository hooks load
+  (trusted workspace). The `.claude/settings.json` `PreToolUse` hook also runs
+  for `Edit|Write|Bash`. Copilot does not honour Claude `permissions.deny`.
+  Live proof is C3.
+- **Claude Code:** honours `permissions.deny` and the `PreToolUse` hook if
+  used here.
+- **Cursor:** unsupported (see above). No adapter.
+- **CI:** honours none of the hook layers. It runs the guard tests as a step,
+  then doctor and conformance.
+
+### Bypass routes that remain open (updated)
+
+- Everything listed under C1 still applies.
+- A guard that hangs past `timeoutSec` lets the tool call through (Copilot
+  timeouts fail open).
+- Long free-text arguments (subagent prompts, memory citations) are walked as
+  strings. A string that is exactly a guarded path makes an unknown tool deny
+  — a false positive, which fails closed.

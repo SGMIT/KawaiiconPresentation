@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "python3 .claude/hooks/tamper_guard.py",
+        "cwd": ".",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}

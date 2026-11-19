@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 
 GUARD = Path(__file__).resolve().with_name("tamper_guard.py")
+REPO = GUARD.parents[2]
+COPILOT_ADAPTER = REPO / ".github" / "hooks" / "tamper-guard.json"
 
 
 def run_guard(stdin: bytes) -> tuple[str, int, str]:
@@ -47,6 +50,37 @@ def bash(command: str) -> bytes:
 def patch(*headers: str, body: str = "@@\n-a\n+b\n") -> bytes:
     text = "*** Begin Patch\n" + "".join(f"{h}\n{body}" for h in headers) + "*** End Patch\n"
     return claude("apply_patch", {"input": text})
+
+
+def copilot(tool: str, tool_args) -> bytes:
+    """Copilot camelCase preToolUse payload; toolArgs is typed `unknown`."""
+    return json.dumps({
+        "sessionId": "test",
+        "timestamp": 0,
+        "cwd": str(REPO),
+        "toolName": tool,
+        "toolArgs": tool_args,
+    }).encode("utf-8")
+
+
+def vscode(tool: str, tool_input) -> bytes:
+    """Copilot PascalCase PreToolUse payload: Claude tool names, snake_case."""
+    return json.dumps({
+        "hook_event_name": "PreToolUse",
+        "session_id": "test",
+        "timestamp": "1970-01-01T00:00:00Z",
+        "cwd": str(REPO),
+        "tool_name": tool,
+        "tool_input": tool_input,
+    }).encode("utf-8")
+
+
+def abs_path(rel: str) -> str:
+    return str(REPO / rel)
+
+
+def patch_text(*headers: str, body: str = "@@\n-a\n+b\n") -> str:
+    return "*** Begin Patch\n" + "".join(f"{h}\n{body}" for h in headers) + "*** End Patch\n"
 
 
 def budget_exhausted() -> bool:
@@ -91,6 +125,29 @@ DENY = {
     "whitespace_stdin": b"  \n",
     "malformed_stdin": b"{not json",
     "non_object_stdin": b"[]",
+    # Copilot camelCase: toolArgs as object, JSON string, or raw patch text.
+    "copilot_create_declaration_abs": copilot("create", {
+        "path": abs_path(".claude/harness.json"), "file_text": "{}"}),
+    "copilot_edit_args_json_string": copilot("edit", json.dumps({
+        "path": abs_path("bin/harness"), "old_str": "a", "new_str": "b"})),
+    "copilot_str_replace_editor_agents_md": copilot("str_replace_editor", {
+        "command": "str_replace", "path": abs_path("AGENTS.md"),
+        "old_str": "a", "new_str": "b"}),
+    "copilot_apply_patch_raw_string": copilot(
+        "apply_patch", patch_text("*** Update File: bin/harness")),
+    "copilot_apply_patch_json_string": copilot(
+        "apply_patch", json.dumps(patch_text("*** Update File: bin/harness"))),
+    "copilot_bash_compound": copilot("bash", {
+        "command": "git status && echo x > CLAUDE.md", "description": "status"}),
+    "copilot_bash_args_json_string": copilot("bash", json.dumps({
+        "command": "cat notes.md > bin/harness"})),
+    "copilot_powershell_set_content": copilot("powershell", {
+        "command": "git status; Set-Content -Path bin/harness -Value x"}),
+    "copilot_create_adapter_config": copilot("create", {
+        "path": abs_path(".github/hooks/other.json"), "file_text": "{}"}),
+    # Copilot PascalCase: apply_patch arrives as Edit with a raw-string input.
+    "vscode_edit_raw_patch": vscode("Edit", patch_text("*** Update File: bin/harness")),
+    "vscode_bash_compound": vscode("Bash", {"command": "git status && echo x > CLAUDE.md"}),
 }
 
 ALLOW = {
@@ -102,10 +159,20 @@ ALLOW = {
     "shell_cd_guarded_dir_read_only": bash("cd .claude && cat harness.json"),
     "apply_patch_writable_only": patch("*** Update File: index.html"),
     "read_guarded": claude("Read", {"file_path": ".claude/harness.json"}),
+    "copilot_create_index_html_abs": copilot("create", {
+        "path": abs_path("index.html"), "file_text": "<html></html>"}),
+    "copilot_apply_patch_writable": copilot(
+        "apply_patch", patch_text("*** Update File: index.html")),
+    "copilot_bash_harness_verify": copilot("bash", {"command": "python3 bin/harness verify"}),
+    "copilot_view_guarded": copilot("view", {"path": abs_path(".claude/harness.json")}),
+    "copilot_rg_guarded": copilot("rg", {"pattern": "deny", "path": abs_path("bin/harness")}),
 }
 
 # Allow cases that mutate are subject to the soft budget halt.
-MUTATING_ALLOWS = {"write_index_html", "shell_redirect_into_writable", "apply_patch_writable_only"}
+MUTATING_ALLOWS = {
+    "write_index_html", "shell_redirect_into_writable", "apply_patch_writable_only",
+    "copilot_create_index_html_abs", "copilot_apply_patch_writable",
+}
 
 
 class GuardDecisions(unittest.TestCase):
@@ -134,6 +201,60 @@ for _name, _payload in DENY.items():
     setattr(GuardDecisions, f"test_deny_{_name}", _deny_case(_payload))
 for _name, _payload in ALLOW.items():
     setattr(GuardDecisions, f"test_allow_{_name}", _allow_case(_name, _payload))
+
+
+class CopilotContract(unittest.TestCase):
+    """Copilot reads top-level permissionDecision; see docs.github.com
+    /en/copilot/reference/hooks-reference ("preToolUse decision control")."""
+
+    def test_deny_carries_permission_decision_and_reason(self):
+        _, code, out = run_guard(copilot("create", {
+            "path": abs_path("bin/harness"), "file_text": "x"}))
+        body = json.loads(out.splitlines()[-1])
+        self.assertEqual(body.get("permissionDecision"), "deny", out)
+        self.assertTrue(body.get("permissionDecisionReason"), out)
+        self.assertNotEqual(code, 0, out)
+
+    def test_allow_does_not_preapprove(self):
+        # "allow" would skip Copilot's normal permission prompt for every call.
+        _, code, out = run_guard(copilot("view", {"path": abs_path("index.html")}))
+        body = json.loads(out.splitlines()[-1])
+        self.assertNotIn("permissionDecision", body, out)
+        self.assertEqual(code, 0, out)
+
+
+@unittest.skipIf(shutil.which("bash") is None, "adapter command is bash-only")
+class CopilotAdapter(unittest.TestCase):
+    """Run the adapter's own configured command, as Copilot CLI would."""
+
+    def entries(self) -> list[dict]:
+        config = json.loads(COPILOT_ADAPTER.read_text(encoding="utf-8"))
+        self.assertEqual(config.get("version"), 1)
+        entries = config.get("hooks", {}).get("preToolUse", [])
+        self.assertTrue(entries, "no preToolUse entries")
+        return entries
+
+    def run_entry(self, entry: dict, payload: bytes) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", "-c", entry["bash"]], cwd=REPO / entry.get("cwd", "."),
+            input=payload, capture_output=True, timeout=30, check=False,
+        )
+
+    def test_adapter_denies_protected_write(self):
+        for entry in self.entries():
+            proc = self.run_entry(entry, copilot("apply_patch", patch_text(
+                "*** Update File: .claude/harness.json")))
+            out = proc.stdout.decode("utf-8", "replace")
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertEqual(json.loads(out.splitlines()[-1]).get("permissionDecision"), "deny", out)
+
+    def test_adapter_allows_writable(self):
+        if budget_exhausted():
+            self.skipTest("verify budget exhausted at HEAD; guard correctly halts writes")
+        for entry in self.entries():
+            proc = self.run_entry(entry, copilot("create", {
+                "path": abs_path("index.html"), "file_text": "x"}))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":

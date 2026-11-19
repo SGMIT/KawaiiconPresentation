@@ -2,10 +2,19 @@
 """Tool-agnostic tamper guard for Taniko sandbox boundaries.
 
 Single source of truth: .claude/harness.json sandbox.protected and
-sandbox.read_only (plus .cursor/** so IDE adapter configs cannot rewrite
-themselves). Invoked by thin per-CLI adapters (Claude Code PreToolUse,
-Cursor preToolUse / beforeShellExecution). Stdlib only, deterministic,
-fail-closed on parse or declaration errors. No model judgment.
+sandbox.read_only (plus ALWAYS_DENY so adapter configs cannot rewrite
+themselves). Invoked by thin per-CLI adapters: Claude Code PreToolUse
+(.claude/settings.json) and GitHub Copilot preToolUse
+(.github/hooks/tamper-guard.json). Stdlib only, deterministic, fail-closed
+on parse or declaration errors. No model judgment.
+
+Payload shapes (Copilot: docs.github.com/en/copilot/reference/hooks-reference):
+  - Claude / Copilot PascalCase: tool_name + tool_input
+  - Copilot camelCase: toolName + toolArgs (typed unknown: an object, a JSON
+    string, or raw text such as an apply_patch body)
+Deny output carries Claude's hookSpecificOutput and Copilot's top-level
+permissionDecision/permissionDecisionReason, and exits 2. Allow output never
+sets permissionDecision: "allow" would pre-approve the call in Copilot.
 
 What it matches:
   - file paths from tool payloads (path / file_path / target_file / ...)
@@ -42,8 +51,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 DECL_REL = ".claude/harness.json"
 # Always guarded even if a declaration omits it: adapter configs must not
-# rewrite the boundary that loads them.
-ALWAYS_DENY = (".cursor/**",)
+# rewrite the boundary that loads them. .cursor/** stays guarded after Cursor
+# support was dropped so a new Cursor config cannot appear unreviewed.
+ALWAYS_DENY = (".cursor/**", ".github/hooks/**")
 
 WRITE_TOOLS = {
     "write", "edit", "delete", "editnotebook", "notebookedit",
@@ -54,7 +64,7 @@ WRITE_TOOLS = {
 }
 SHELL_TOOLS = {"shell", "bash", "powershell", "cmd", "terminal", "run_in_terminal"}
 READ_TOOLS = {
-    "read", "grep", "glob", "ls", "view", "semanticsearch", "readbytestream",
+    "read", "grep", "rg", "glob", "ls", "view", "semanticsearch", "readbytestream",
     "readfile", "read_file", "readlints", "list_dir", "file_search",
     "grep_search", "codebase_search",
 }
@@ -104,15 +114,20 @@ def deny(reason: str, event: str) -> int:
         "permission": "deny",
         "user_message": msg,
         "agent_message": msg,
+        # Copilot preToolUse decision control (camelCase and PascalCase).
+        "permissionDecision": "deny",
+        "permissionDecisionReason": msg,
     }
-    # Claude Code nested shape (also accepted by Cursor third-party import).
-    if event.lower() in ("pretooluse", "permissionrequest"):
+    # Claude Code nested shape.
+    if event.lower() in ("", "pretooluse", "permissionrequest"):
         flat["hookSpecificOutput"] = {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": msg,
         }
     print(json.dumps(flat))
+    # Claude Code reads the reason from stderr on exit 2.
+    print(msg, file=sys.stderr)
     return 2
 
 
@@ -412,16 +427,30 @@ def event_of(payload: dict) -> str:
     return ""
 
 
+def coerce_tool_input(v) -> dict | None:
+    """Copilot toolArgs/tool_input are typed unknown: object, JSON text, or raw text."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except json.JSONDecodeError:
+            return {"input": v}
+    if isinstance(v, dict):
+        return v
+    if v is None:
+        return None
+    return {"input": v}
+
+
 def extract_tool_input(payload: dict) -> dict:
-    for key in ("tool_input", "toolInput", "input"):
-        v = payload.get(key)
-        if isinstance(v, dict):
+    for key in ("tool_input", "toolInput", "toolArgs", "input"):
+        v = coerce_tool_input(payload.get(key))
+        if v is not None:
             return v
     return {}
 
 
 def read_stdin_json() -> dict:
-    """Parse hook stdin. Cursor-on-Windows may deliver UTF-16; Unix is UTF-8."""
+    """Parse hook stdin. Windows shells may deliver UTF-16; Unix is UTF-8."""
     data = sys.stdin.buffer.read()
     if not data or not data.strip():
         raise ValueError("empty hook stdin (fail closed)")

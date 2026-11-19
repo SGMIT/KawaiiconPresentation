@@ -401,7 +401,8 @@ def check_tamper_rules_aligned(decl: dict) -> dict:
 
     Does not prove enforcement. It only checks that .claude/settings.json
     deny-lists every protected and read_only glob, that the shared guard
-    script exists, and that the Cursor adapter points at it.
+    script exists, that a Copilot preToolUse adapter in .github/hooks/
+    invokes it, and that the adapter's interpreter is on PATH.
     """
     req = "settings deny + hooks cover sandbox.protected and sandbox.read_only"
     sandbox = decl.get("sandbox") if isinstance(decl.get("sandbox"), dict) else {}
@@ -412,7 +413,7 @@ def check_tamper_rules_aligned(decl: dict) -> dict:
             globs.extend(g for g in vals if isinstance(g, str))
     settings_rel = ".claude/settings.json"
     guard_rel = ".claude/hooks/tamper_guard.py"
-    cursor_rel = ".cursor/hooks.json"
+    copilot_dir_rel = ".github/hooks"
     settings_path = ROOT / settings_rel
     if not settings_path.is_file():
         return check("tamper-rules-aligned", "file", "fail", req, "missing settings",
@@ -439,27 +440,44 @@ def check_tamper_rules_aligned(decl: dict) -> dict:
         return check("tamper-rules-aligned", "file", "fail", req, "missing guard",
                      f"{guard_rel} missing; adapters have nothing portable to invoke",
                      f"Restore {guard_rel} from git")
-    cursor_path = ROOT / cursor_rel
-    if not cursor_path.is_file():
-        return check("tamper-rules-aligned", "file", "warn", req, "no Cursor adapter",
-                     f"{cursor_rel} missing; Cursor sessions on this repo will not load the shared guard",
-                     f"Add {cursor_rel} invoking {guard_rel} if this team uses Cursor")
-    try:
-        cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-        return check("tamper-rules-aligned", "file", "fail", req, "unparseable Cursor hooks",
-                     f"{cursor_rel}: {e}")
-    blob = json.dumps(cursor).replace("\\", "/")
-    if guard_rel not in blob and "run_guard.ps1" not in blob:
-        return check("tamper-rules-aligned", "file", "fail", req, "Cursor hooks miss guard",
-                     f"{cursor_rel} does not reference {guard_rel} or run_guard.ps1",
-                     f"Point Cursor hooks at {guard_rel}")
+    # Copilot adapter: a preToolUse command entry in .github/hooks/*.json
+    # whose bash command runs the shared guard. Command hooks fail closed, so
+    # a missing interpreter denies every tool call; warn before that happens.
+    adapter_rel = None
+    launcher = None
+    for cfg in sorted((ROOT / copilot_dir_rel).glob("*.json")):
+        rel = cfg.relative_to(ROOT).as_posix()
+        try:
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            return check("tamper-rules-aligned", "file", "fail", req, "unparseable Copilot hooks",
+                         f"{rel}: {e}")
+        hooks_map = data.get("hooks") if isinstance(data, dict) else None
+        entries = hooks_map.get("preToolUse") if isinstance(hooks_map, dict) else None
+        for entry in entries if isinstance(entries, list) else []:
+            cmd = entry.get("bash") if isinstance(entry, dict) else None
+            if isinstance(cmd, str) and guard_rel in cmd.replace("\\", "/"):
+                adapter_rel, launcher = rel, cmd.split()[0]
+                break
+        if adapter_rel:
+            break
+    if adapter_rel is None:
+        return check("tamper-rules-aligned", "file", "fail", req, "no Copilot adapter",
+                     f"no {copilot_dir_rel}/*.json preToolUse entry runs {guard_rel}; "
+                     "Copilot sessions on this repo are unguarded",
+                     f"Add {copilot_dir_rel}/tamper-guard.json (reviewed) invoking {guard_rel}")
+    if shutil.which(launcher) is None:
+        return check("tamper-rules-aligned", "file", "warn", req, "adapter interpreter missing",
+                     f"{adapter_rel} runs {launcher!r}, which is not on PATH; Copilot will deny "
+                     "every tool call (fail closed)",
+                     f"Install {launcher} or put it on the PATH Copilot inherits")
     hooks = settings.get("hooks") if isinstance(settings, dict) else None
     if not isinstance(hooks, dict) or "PreToolUse" not in hooks:
         return check("tamper-rules-aligned", "file", "warn", req, "no Claude PreToolUse hook",
                      f"{settings_rel} has deny rules but no PreToolUse hook invoking the shared guard")
     return check("tamper-rules-aligned", "file", "pass", req,
-                 f"{len(globs)} glob(s) deny-listed; guard + Cursor adapter present")
+                 f"{len(globs)} glob(s) deny-listed; guard + Copilot adapter ({adapter_rel}) "
+                 "+ Claude hook present")
 
 
 def check_harness_lf() -> dict:
