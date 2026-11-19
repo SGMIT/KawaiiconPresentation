@@ -21,7 +21,7 @@
   "sandbox": {
     "writable": ["index.html", "css/**", "assets/**", "notes.md", "sources.md", "docs/**", "graph/**"],
     "read_only": ["README.md"],
-    "protected": [".claude/**", "bin/**", ".github/**", ".cursor/**", "AGENTS.md", "CLAUDE.md", "TANIKO_VERSION", ".gitignore"]
+    "protected": [".claude/**", "bin/**", ".github/**", ".cursor/**", "AGENTS.md", "CLAUDE.md", "TANIKO_VERSION", ".gitignore", ".taniko-graph-fixture"]
   },
   "state": { "dir": ".agent" },
   "verify": {

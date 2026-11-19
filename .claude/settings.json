@@ -18,7 +18,9 @@
       "Edit(.gitignore)",
       "Write(.gitignore)",
       "Edit(README.md)",
-      "Write(README.md)"
+      "Write(README.md)",
+      "Edit(.taniko-graph-fixture)",
+      "Write(.taniko-graph-fixture)"
     ],
     "allow": [
       "Edit(index.html)",
