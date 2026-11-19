@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""tier-graph: run graph/tests under the bin/harness tier contract.
+
+Exit 0 pass, 1 fail, 2 error, and write {verdict, detail, feedback} to
+$KC_TIER_RESULT. Zero executed tests is an error, never a vacuous pass.
+Import/collection errors are errors, not test failures.
+"""
+import io
+import json
+import os
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path.cwd()
+TESTS = ROOT / "graph" / "tests"
+EXIT = {"pass": 0, "fail": 1, "error": 2}
+
+
+def finish(verdict, detail, summary=None, details=None, locations=None):
+    record = {"tier": "graph", "verdict": verdict, "detail": detail}
+    if verdict != "pass":
+        fb = {"summary": (summary or detail)[:500]}
+        if details:
+            fb["details"] = details[-4000:]
+        if locations:
+            fb["locations"] = locations[:20]
+        record["feedback"] = fb
+    target = os.environ.get("KC_TIER_RESULT")
+    if target:
+        Path(target).write_text(json.dumps(record), encoding="utf-8")
+    print(f"TIER graph: {verdict.upper()} - {detail}")
+    if verdict != "pass":
+        print(record["feedback"]["summary"])
+    return EXIT[verdict]
+
+
+def location(test, tb):
+    loc = {"file": "", "message": test.id()[:300]}
+    for line in reversed(tb.splitlines()):
+        line = line.strip()
+        if line.startswith('File "') and str(ROOT) in line:
+            path = line.split('"')[1]
+            loc["file"] = os.path.relpath(path, ROOT)
+            if ", line " in line:
+                num = line.split(", line ")[1].split(",")[0]
+                if num.isdigit():
+                    loc["line"] = int(num)
+            break
+    return loc
+
+
+def main():
+    if not TESTS.is_dir():
+        return finish("error", "graph/tests does not exist",
+                      "no graph test surface; provision graph/tests before declaring this tier green")
+    sys.path.insert(0, str(ROOT))
+    loader = unittest.TestLoader()
+    suite = loader.discover(str(TESTS), top_level_dir=str(ROOT))
+    if loader.errors:
+        return finish("error", f"{len(loader.errors)} test module(s) failed to import",
+                      "graph tests could not be collected; fix the import before judging",
+                      "\n".join(loader.errors))
+    stream = io.StringIO()
+    result = unittest.TextTestRunner(stream=stream, verbosity=1).run(suite)
+    ran, skipped = result.testsRun, len(result.skipped)
+    failed, errored = len(result.failures), len(result.errors)
+    counts = f"{ran} run, {failed} failed, {errored} errored, {skipped} skipped"
+    if ran - skipped == 0:
+        return finish("error", f"0 tests executed ({counts})",
+                      "no graph test executed; zero executed tests is not evidence")
+    bad = result.failures + result.errors
+    if bad:
+        return finish("fail", counts,
+                      f"{failed + errored} of {ran} graph tests did not pass: "
+                      + ", ".join(t.id() for t, _ in bad[:5]),
+                      stream.getvalue(), [location(t, tb) for t, tb in bad])
+    return finish("pass", counts)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:  # noqa: BLE001
+        sys.exit(finish("error", f"crashed: {type(e).__name__}", f"tier-graph crashed: {e}"))

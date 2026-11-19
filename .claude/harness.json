@@ -19,7 +19,7 @@
     }
   ],
   "sandbox": {
-    "writable": ["index.html", "css/**", "assets/**", "notes.md", "sources.md", "docs/**"],
+    "writable": ["index.html", "css/**", "assets/**", "notes.md", "sources.md", "docs/**", "graph/**"],
     "read_only": ["README.md"],
     "protected": [".claude/**", "bin/**", ".github/**", ".cursor/**", "AGENTS.md", "CLAUDE.md", "TANIKO_VERSION", ".gitignore"]
   },
@@ -27,7 +27,8 @@
   "verify": {
     "tiers": [
       { "id": "static", "cost_class": "static", "command": ["python3", "bin/harness", "tier-static"], "timeout_seconds": 30, "expected_seconds": 1 },
-      { "id": "content", "cost_class": "static", "command": ["python3", "bin/harness", "tier-content"], "timeout_seconds": 30, "expected_seconds": 1 }
+      { "id": "content", "cost_class": "static", "command": ["python3", "bin/harness", "tier-content"], "timeout_seconds": 30, "expected_seconds": 1 },
+      { "id": "graph", "cost_class": "unit", "command": ["python3", "bin/tier-graph"], "timeout_seconds": 120, "expected_seconds": 5 }
     ],
     "profiles": { "quick": ["static"] },
     "budgets": { "max_attempts_total": 3, "max_attempts_per_tier": 2 }

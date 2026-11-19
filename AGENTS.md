@@ -6,7 +6,8 @@ Never edit `.claude/`, `bin/`, `.github/`, `AGENTS.md`, `CLAUDE.md`, `TANIKO_VER
 ## Scope
 
 - You may edit the deck content only: `index.html`, `css/**`, `assets/**`, `notes.md`, `sources.md`.
-- You may also append to `docs/taniko/STRAIN.md` (see Recording strain).
+- You may edit graph layer code: `graph/**`.
+- You may also append to `docs/taniko/STRAIN.md` and `docs/taniko/PROGRESS.md` (see Recording strain).
 - `README.md` is read-only.
 - The harness declaration is `.claude/harness.json`; session state lives in `.agent/` (gitignored, never commit it).
 
